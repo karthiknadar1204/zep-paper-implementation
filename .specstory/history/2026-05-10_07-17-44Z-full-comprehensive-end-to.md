@@ -2533,3 +2533,348 @@ _**Agent (claude-opus-4-7 2026-05-10 07:56:15Z)**_
 Because JWTs aren't stored — they're freshly minted each time you call `signToken`. The payload contains `exp: Math.floor(Date.now()/1000) + 7days`, which is computed *now*. Signup and login happen at different `Date.now()`s, so the `exp` differs, the payload differs, and the signature differs.
 
 It's not a bug. JWTs are **stateless self-contained credentials**, not session IDs — there's no "the user's token" sitting in a row somewhere. A user can have arbitrarily many valid tokens at once; each one decodes to the same `userId` and grants the same access until its `exp` passes. If you want a single canonical token per session, that's a different model (database-backed sessions), and you don't need it for what we're building.
+
+---
+
+_**User (2026-05-10 08:01:13Z)**_
+
+hmm auth is done,we can move to ingestion i believe,step by step
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 08:01:51Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:02:02Z)**_
+
+Here's the next chunk laid out. Ingestion really has two natural phases — I'd suggest doing **Phase C first** (the API endpoints, no worker yet — this gets episodes into Postgres), then pausing before **Phase D** (Redis + BullMQ + worker harness) so you can verify each layer.
+
+---
+
+## Phase C — Session + raw ingest endpoints (no queue, no LLM)
+
+After this phase, you can hit `POST /ingest` and see rows show up in Postgres with `status = "queued"`. Nothing processes them yet.
+
+### Step 8 — Sessions
+Files:
+- `validators/sessions.validator.ts` — Zod for `{ title? }`
+- `services/sessions.service.ts` — `createSession(userId, title?)`, `listSessionsForUser(userId)`
+- `controllers/sessions.controller.ts` — handlers
+- `routes/sessions.routes.ts` — `POST /` (create), `GET /` (list mine)
+- Wire into `index.ts` as a **protected** sub-app at `/sessions`
+
+### Step 9 — Raw ingest
+Files:
+- `validators/ingest.validator.ts` — Zod for `{ sessionId: uuid, actor: "user"|"assistant"|"system", content: string, occurredAt?: ISO }`
+- `services/episodes.service.ts` — `createEpisode(...)` (verifies session belongs to `userId`, inserts with `status: "queued"`)
+- `controllers/ingest.controller.ts` — handler returning `202 { episodeId, status: "queued" }`
+- `routes/ingest.routes.ts` — `POST /`
+- Mount protected at `/ingest`
+
+### Step 10 — Episode inspect (debug-friendly read)
+Files:
+- `services/episodes.service.ts` — add `getEpisodeWithLogs(userId, episodeId)`
+- `controllers/episodes.controller.ts` — `GET /:id`
+- `routes/episodes.routes.ts`
+- Mount protected at `/episodes`
+
+---
+
+## Phase D (later — not in this batch)
+
+Step 11 (Redis), Step 12 (BullMQ queues), Step 13 (worker harness that just toggles status). I'll stop after Phase C so you can confirm the fast path works in Postman before we add the queue.
+
+---
+
+**Shall I execute Phase C now (Steps 8–10) as one batch?** Same MVC layout as auth, all routes protected by `requireAuth`. Once you say go, I'll write the files and you can Postman-test ingest right after.
+
+---
+
+_**User (2026-05-10 08:02:51Z)**_
+
+ohk do the step 8 then and tell me how to test it on postman
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 08:03:47Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:04:07Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { z } from "zod";
+
+export const createSessionSchema = z.object({
+  title: z.string().min(1).max(200).optional(),
+});
+
+export type CreateSessionInput = z.infer<typeof createSessionSchema>;
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/validators/sessions.validator.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:05:23Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { eq, desc } from "drizzle-orm";
+import { db } from "../models/db";
+import { sessions } from "../models/schema";
+
+export type SessionRow = typeof sessions.$inferSelect;
+
+export async function createSession(
+  userId: string,
+  title?: string,
+): Promise<SessionRow> {
+  const [row] = await db
+    .insert(sessions)
+    .values({ userId, title: title ?? null })
+    .returning();
+  return row;
+}
+
+export async function listSessionsForUser(
+  userId: string,
+): Promise<SessionRow[]> {
+  return db
+    .select()
+    .from(sessions)
+    .where(eq(sessions.userId, userId))
+    .orderBy(desc(sessions.createdAt));
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/sessions.service.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:05:40Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import type { Context } from "hono";
+import type { AuthVariables } from "../middleware/auth.middleware";
+import { createSessionSchema } from "../validators/sessions.validator";
+import * as sessionsService from "../services/sessions.service";
+
+export async function createSession(
+  c: Context<{ Variables: AuthVariables }>,
+) {
+  const userId = c.get("userId");
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = createSessionSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "VALIDATION_ERROR", issues: parsed.error.issues },
+      400,
+    );
+  }
+
+  const session = await sessionsService.createSession(
+    userId,
+    parsed.data.title,
+  );
+  return c.json({ session }, 201);
+}
+
+export async function listSessions(
+  c: Context<{ Variables: AuthVariables }>,
+) {
+  const userId = c.get("userId");
+  const items = await sessionsService.listSessionsForUser(userId);
+  return c.json({ sessions: items });
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/controllers/sessions.controller.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:05:53Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { Hono } from "hono";
+import type { AuthVariables } from "../middleware/auth.middleware";
+import {
+  createSession,
+  listSessions,
+} from "../controllers/sessions.controller";
+
+export const sessionsRouter = new Hono<{ Variables: AuthVariables }>();
+
+sessionsRouter.post("/", createSession);
+sessionsRouter.get("/", listSessions);
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/routes/sessions.routes.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:05:58Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./server/src/index.ts`
+
+```text
+1	import { Hono } from "hono";
+2	import { logger } from "hono/logger";
+3	import { cors } from "hono/cors";
+4	import { authRouter } from "./routes/auth.routes";
+5	import {
+6	  requireAuth,
+7	  type AuthVariables,
+8	} from "./middleware/auth.middleware";
+9	
+10	const app = new Hono<{ Variables: AuthVariables }>();
+11	
+12	app.use("*", logger());
+13	app.use("*", cors());
+14	
+15	app.get("/", (c) => c.text("Zep memory server"));
+16	
+17	app.route("/auth", authRouter);
+18	
+19	const protectedRoutes = new Hono<{ Variables: AuthVariables }>();
+20	protectedRoutes.use("*", requireAuth);
+21	protectedRoutes.get("/me", (c) => c.json({ userId: c.get("userId") }));
+22	
+23	app.route("/", protectedRoutes);
+24	
+25	export default {
+26	  port: 3002,
+27	  fetch: app.fetch,
+28	};
+29
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:06:04Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/index.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:06:17Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/index.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:06:33Z)**_
+
+Step 8 done. Files created/touched:
+
+- `server/src/validators/sessions.validator.ts:1`
+- `server/src/services/sessions.service.ts:1`
+- `server/src/controllers/sessions.controller.ts:1`
+- `server/src/routes/sessions.routes.ts:1`
+- `server/src/index.ts:21` — mounted at `/sessions` (protected)
+
+Restart `bun run dev` before testing.
+
+---
+
+## Postman tests for sessions
+
+Both routes need the JWT from login. The cleanest way is to set an **Authorization header on the collection** so every request inherits it:
+
+1. In Postman, click the **collection** (Zep Memory) → **Authorization** tab.
+2. Type: **Bearer Token**, Token: `{{token}}`.
+3. On each request, leave Auth as "Inherit auth from parent."
+
+Then any request you add inherits the token automatically. From now on you don't need to set Auth per-request.
+
+---
+
+### Request — Create session
+
+| Field | Value |
+|---|---|
+| Method | `POST` |
+| URL | `{{baseUrl}}/sessions` |
+
+**Body → raw → JSON** (title is optional):
+```json
+{ "title": "First conversation" }
+```
+Or send `{}` for an untitled session.
+
+Expected `201`:
+```json
+{
+  "session": {
+    "id": "uuid-here",
+    "userId": "your-user-uuid",
+    "title": "First conversation",
+    "createdAt": "2026-05-10T..."
+  }
+}
+```
+
+**Pro tip — auto-save the sessionId.** Tests tab:
+```js
+const data = pm.response.json();
+pm.collectionVariables.set("sessionId", data.session.id);
+```
+Now `{{sessionId}}` is available for the ingest request later.
+
+**Failure cases:**
+- No `Authorization` header → `401 UNAUTHORIZED`
+- `{ "title": "" }` (empty string) → `400 VALIDATION_ERROR`
+
+---
+
+### Request — List my sessions
+
+| Field | Value |
+|---|---|
+| Method | `GET` |
+| URL | `{{baseUrl}}/sessions` |
+
+Expected `200`:
+```json
+{
+  "sessions": [
+    { "id": "...", "userId": "...", "title": "First conversation", "createdAt": "..." },
+    { "id": "...", "userId": "...", "title": null,                  "createdAt": "..." }
+  ]
+}
+```
+
+Newest first. Returns only **your** sessions (filtered by `userId` from the JWT) — try it: create a second user via signup, log in as them, hit `GET /sessions`, you'll see an empty list.
+
+**Failure cases:**
+- No `Authorization` header → `401 UNAUTHORIZED`
+- Tampered token → `401 INVALID_TOKEN`
+
+---
+
+Once you confirm these two work, we move to **Step 9 (raw ingest endpoint)**.

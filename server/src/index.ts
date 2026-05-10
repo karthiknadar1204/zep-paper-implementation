@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { logger } from "hono/logger";
 import { cors } from "hono/cors";
 import { authRouter } from "./routes/auth.routes";
+import { sessionsRouter } from "./routes/sessions.routes";
 import {
   requireAuth,
   type AuthVariables,
@@ -19,6 +20,7 @@ app.route("/auth", authRouter);
 const protectedRoutes = new Hono<{ Variables: AuthVariables }>();
 protectedRoutes.use("*", requireAuth);
 protectedRoutes.get("/me", (c) => c.json({ userId: c.get("userId") }));
+protectedRoutes.route("/sessions", sessionsRouter);
 
 app.route("/", protectedRoutes);
 
