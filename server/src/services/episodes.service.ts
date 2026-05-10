@@ -1,6 +1,7 @@
 import { and, asc, eq } from "drizzle-orm";
 import { db } from "../models/db";
 import { sessions, episodes, processingLogs } from "../models/schema";
+import { enqueueEpisodeProcessing } from "../queues/ingestion.queue";
 
 export class SessionNotFoundError extends Error {
   constructor() {
@@ -52,6 +53,8 @@ export async function createEpisode(
       occurredAt,
     })
     .returning();
+
+  await enqueueEpisodeProcessing(row.id);
 
   return row;
 }

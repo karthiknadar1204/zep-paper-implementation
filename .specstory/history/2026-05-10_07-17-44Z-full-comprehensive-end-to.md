@@ -3963,3 +3963,413 @@ Expected `200`:
 | GET | `/episodes/:id` | Inspect episode + logs |
 
 Next is **Phase D — Redis + BullMQ + worker harness**. The worker won't do LLM work yet — it'll just transition `queued → processing → processed`, prove the queue plumbing works, and write rows to `processing_logs`. Want to keep going to Step 11 (Redis decision) and Step 12 (queue setup)?
+
+---
+
+_**User (2026-05-10 08:25:25Z)**_
+
+for redis,lets use ioredis,best for fast prototyping,simultaneously proceed to finish step 12
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 08:26:06Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:26:19Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import IORedis from "ioredis";
+import { config } from "dotenv";
+
+config({ path: ".env.local" });
+
+const REDIS_URL = process.env.REDIS_URL;
+if (!REDIS_URL) {
+  throw new Error("REDIS_URL env var is required");
+}
+
+export const redisConnection = new IORedis(REDIS_URL, {
+  maxRetriesPerRequest: null,
+});
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/queues/connection.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:26:39Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { Queue } from "bullmq";
+import { redisConnection } from "./connection";
+
+export const INGESTION_QUEUE_NAME = "memory-ingestion";
+
+export type IngestionJobData = {
+  episodeId: string;
+};
+
+export const ingestionQueue = new Queue<IngestionJobData>(
+  INGESTION_QUEUE_NAME,
+  {
+    connection: redisConnection,
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: { type: "exponential", delay: 1000 },
+      removeOnComplete: { age: 60 * 60 * 24 },
+      removeOnFail: { age: 60 * 60 * 24 * 7 },
+    },
+  },
+);
+
+export async function enqueueEpisodeProcessing(episodeId: string) {
+  return ingestionQueue.add(
+    "process-episode",
+    { episodeId },
+    { jobId: episodeId },
+  );
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/queues/ingestion.queue.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:26:46Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/episodes.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:27:06Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/episodes.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:27:24Z)**_
+
+Step 12 done. Files:
+
+- `server/src/queues/connection.ts:1` — shared ioredis connection (with `maxRetriesPerRequest: null` — required by BullMQ, otherwise it throws on startup)
+- `server/src/queues/ingestion.queue.ts:1` — `ingestionQueue` + `enqueueEpisodeProcessing(episodeId)` helper
+- `server/src/services/episodes.service.ts` — `createEpisode` now enqueues a job after the insert
+
+Key choices baked in:
+- `jobId: episodeId` — BullMQ deduplicates, so the same episode can never be enqueued twice.
+- `attempts: 3` with exponential backoff (matches the original spec).
+- Completed jobs reaped after 1 day, failed after 7 days — keeps Redis lean for prototyping.
+
+---
+
+### Two things you need to do before testing
+
+**1. Add the env var** (`server/.env.local`):
+```
+REDIS_URL=redis://localhost:6379
+```
+
+**2. Have Redis running locally.** Pick whichever:
+```bash
+# macOS via brew (persistent):
+brew install redis && brew services start redis
+
+# or one-off via Docker:
+docker run -d --name redis -p 6379:6379 redis:7
+```
+
+Verify it's up:
+```bash
+redis-cli ping     # → PONG
+```
+
+Then restart `bun run dev`.
+
+---
+
+### Verification — you'll see jobs pile up but never get processed (no worker yet)
+
+1. Hit `POST /ingest` from Postman as before — should still return `202 { episodeId, "queued" }`.
+2. In a terminal, peek at the queue:
+   ```bash
+   redis-cli KEYS 'bull:memory-ingestion:*'
+   redis-cli LLEN 'bull:memory-ingestion:wait'
+   ```
+   The `wait` list grows by 1 every ingest. Each job's data is the JSON `{ "episodeId": "..." }`.
+3. To inspect a job's payload:
+   ```bash
+   redis-cli LRANGE 'bull:memory-ingestion:wait' 0 -1
+   # use the IDs returned to fetch:
+   redis-cli HGETALL 'bull:memory-ingestion:<jobId>'
+   ```
+
+That's expected behavior — jobs accumulate in `wait` because **nothing's consuming them yet**. Step 13 (the worker harness) is what fixes that.
+
+---
+
+### Failure modes to know about
+
+| Symptom | Cause |
+|---|---|
+| Server fails to start with `REDIS_URL env var is required` | Forgot to add it to `.env.local` |
+| `ECONNREFUSED 127.0.0.1:6379` on ingest | Redis isn't running |
+| `BullMQ requires a connection ... maxRetriesPerRequest: null` | Already set in `connection.ts` — shouldn't see this |
+| Ingest hangs / takes long | Redis is up but unreachable; check the URL |
+
+---
+
+Ready for **Step 13 — worker harness** whenever. That'll be a separate Bun entry point (`bun run src/workers/ingestion.worker.ts`) that picks jobs off `wait`, transitions the episode `queued → processing → processed`, and writes a `processing_logs` row. Still no LLM — just proving the queue plumbing end-to-end.
+
+---
+
+_**User (2026-05-10 08:28:09Z)**_
+
+please add the command to start the queue to package,json huh
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 08:28:27Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:28:27Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./server/package.json`
+
+```text
+1	{
+2	  "name": "server",
+3	  "scripts": {
+4	    "dev": "bun run --hot src/index.ts"
+5	  },
+6	  "dependencies": {
+7	    "@neondatabase/serverless": "^1.1.0",
+8	    "@pinecone-database/pinecone": "^7.2.0",
+9	    "bcryptjs": "^3.0.3",
+10	    "bullmq": "^5.76.6",
+11	    "dotenv": "^17.4.2",
+12	    "drizzle-orm": "^0.45.2",
+13	    "hono": "^4.12.18",
+14	    "ioredis": "^5.10.1",
+15	    "jose": "^6.2.3",
+16	    "neo4j-driver": "^6.0.1",
+17	    "openai": "^6.37.0",
+18	    "redis": "^5.12.1",
+19	    "zod": "^4.4.3"
+20	  },
+21	  "devDependencies": {
+22	    "@types/bun": "latest",
+23	    "drizzle-kit": "^0.31.10"
+24	  }
+25	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:28:39Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/package.json has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:28:45Z)**_
+
+Added `bun run worker` to `package.json:5`. Heads up — the file `src/workers/ingestion.worker.ts` doesn't exist yet (that's Step 13), so running the script right now will fail with a missing-file error.
+
+Two unrelated things I noticed in `package.json` while I was in there:
+- `bcryptjs` and `jose` are listed (lines 9, 15) — we ended up not using either (Bun.password + hono/jwt instead). Safe to remove.
+- `redis` (line 18) is the alternative client to `ioredis` — also unused. Safe to remove.
+
+Want me to (a) prune those three deps now and (b) build Step 13 (the worker harness) so the script actually runs? Or just one of those?
+
+---
+
+_**User (2026-05-10 08:29:31Z)**_
+
+  server git:(main) ✗ bun run worker
+$ bun run --hot src/workers/ingestion.worker.ts
+error: Module not found "src/workers/ingestion.worker.ts"
+error: script "worker" exited with code 1
+➜  server git:(main) ✗ 
+
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 08:30:08Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:30:08Z)**_
+
+Building Step 13 now — the stub worker that transitions `queued → processing → processed`.
+
+_**Agent (claude-opus-4-7 2026-05-10 08:30:24Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { Worker, type Job } from "bullmq";
+import { eq } from "drizzle-orm";
+import { db } from "../models/db";
+import { episodes, processingLogs } from "../models/schema";
+import {
+  INGESTION_QUEUE_NAME,
+  type IngestionJobData,
+} from "../queues/ingestion.queue";
+import { redisConnection } from "../queues/connection";
+
+async function processEpisode(job: Job<IngestionJobData>) {
+  const { episodeId } = job.data;
+  const startedAt = Date.now();
+
+  await db
+    .update(episodes)
+    .set({ status: "processing" })
+    .where(eq(episodes.id, episodeId));
+
+  // Pipeline steps land here in Phase E+ (LLM extract → resolve → facts → Neo4j + Pinecone).
+  // For now the worker just transitions status so we can verify queue plumbing.
+
+  await db
+    .update(episodes)
+    .set({ status: "processed", processedAt: new Date() })
+    .where(eq(episodes.id, episodeId));
+
+  await db.insert(processingLogs).values({
+    episodeId,
+    step: "stub-pipeline",
+    status: "ok",
+    durationMs: Date.now() - startedAt,
+  });
+}
+
+const worker = new Worker<IngestionJobData>(
+  INGESTION_QUEUE_NAME,
+  processEpisode,
+  {
+    connection: redisConnection,
+    concurrency: 4,
+  },
+);
+
+worker.on("completed", (job) => {
+  console.log(
+    `[worker] completed ${job.id} (episode ${job.data.episodeId})`,
+  );
+});
+
+worker.on("failed", async (job, err) => {
+  console.error(`[worker] failed ${job?.id}:`, err.message);
+  if (!job) return;
+
+  await db.insert(processingLogs).values({
+    episodeId: job.data.episodeId,
+    step: "stub-pipeline",
+    status: "error",
+    message: err.message,
+  });
+
+  const isFinalAttempt = job.attemptsMade >= (job.opts.attempts ?? 1);
+  if (isFinalAttempt) {
+    await db
+      .update(episodes)
+      .set({ status: "failed" })
+      .where(eq(episodes.id, job.data.episodeId));
+  }
+});
+
+console.log(`[worker] listening on ${INGESTION_QUEUE_NAME}`);
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/workers/ingestion.worker.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:30:38Z)**_
+
+Step 13 done. `server/src/workers/ingestion.worker.ts:1`.
+
+What it does (no LLM yet):
+1. Pulls `{ episodeId }` off `memory-ingestion` queue.
+2. Sets episode status `processing`.
+3. *(real pipeline lands here in Phase E+)*
+4. Sets status `processed`, `processedAt = now`.
+5. Writes a `processing_logs` row with `step: "stub-pipeline"`, `status: "ok"`, `durationMs`.
+
+Failure path: logs error row, and if BullMQ has exhausted all 3 attempts, marks episode `failed`.
+
+---
+
+### Run + verify the full round-trip
+
+You'll need **two terminals**:
+
+```bash
+# terminal 1 — API
+cd server && bun run dev
+
+# terminal 2 — worker
+cd server && bun run worker
+```
+
+Worker terminal should print:
+```
+[worker] listening on memory-ingestion
+```
+
+Then in Postman:
+
+1. **`POST /ingest`** — same body as before. Returns `202 { episodeId, "queued" }`.
+2. Worker terminal **immediately** logs:
+   ```
+   [worker] completed <jobId> (episode <episodeId>)
+   ```
+3. **`GET /episodes/<episodeId>`** → now you should see:
+   ```json
+   {
+     "episode": {
+       "status": "processed",
+       "processedAt": "2026-05-10T...",
+       ...
+     },
+     "logs": [
+       { "step": "stub-pipeline", "status": "ok", "durationMs": 23, ... }
+     ]
+   }
+   ```
+
+Status went `queued → processing → processed`, and you have one log row per processed episode.
+
+---
+
+### What this proves end-to-end
+
+- API can accept ingests (Phase C ✅)
+- Postgres durably stores them (Phase A ✅)
+- BullMQ delivers jobs to a separate process (Phase D ✅)
+- Worker can update status + write logs (Phase D ✅)
+
+Everything from here on is **swapping the no-op block in `processEpisode` for real work**: LLM extraction → entity resolver → temporal invalidation → Neo4j writes → Pinecone upserts. The plumbing is done.
+
+Want me to clean up the unused deps (`bcryptjs`, `jose`, `redis`) now, or jump into **Phase E (Neo4j service + LLM extraction)**?
