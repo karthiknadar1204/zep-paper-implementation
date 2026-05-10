@@ -2878,3 +2878,1088 @@ Newest first. Returns only **your** sessions (filtered by `userId` from the JWT)
 ---
 
 Once you confirm these two work, we move to **Step 9 (raw ingest endpoint)**.
+
+---
+
+_**User (2026-05-10 08:11:32Z)**_
+
+done and tested,now we can move to the ingest endpoint,dont code,tell me what is your plan,how will you do
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 08:12:04Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:12:21Z)**_
+
+Here's how I'd build it, no code yet.
+
+---
+
+### Endpoint contract
+
+`POST /ingest` — protected (uses `requireAuth`).
+
+**Request body:**
+```json
+{
+  "sessionId": "uuid",
+  "actor": "user" | "assistant" | "system",
+  "content": "string",
+  "occurredAt": "ISO datetime (optional)"
+}
+```
+
+**Response — `202 Accepted`:**
+```json
+{ "episodeId": "uuid", "status": "queued" }
+```
+
+**Why 202 not 201:** the row is created synchronously, but the *memory side-effects* (extraction → graph → vectors) will happen later in the worker. 202 means "I accepted this for processing." This naming becomes meaningful in Phase D when we actually enqueue.
+
+---
+
+### Files I'll add (mirroring the sessions/auth layout)
+
+| File | Responsibility |
+|---|---|
+| `validators/ingest.validator.ts` | Zod schema for the body |
+| `services/episodes.service.ts` | `createEpisode(userId, input)` — verifies session ownership, inserts row |
+| `controllers/ingest.controller.ts` | One handler: parse → call service → return 202 |
+| `routes/ingest.routes.ts` | `POST /` → handler |
+| `index.ts` | Mount `ingestRouter` under the protected group at `/ingest` |
+
+---
+
+### Validation rules (Zod)
+
+- `sessionId`: `z.uuid()`
+- `actor`: `z.enum(["user", "assistant", "system"])`
+- `content`: `z.string().min(1).max(50000)`
+- `occurredAt`: `z.iso.datetime().optional()` — coerce to `Date` in the service; default to `new Date()`
+
+---
+
+### Security: session ownership check
+
+This is the one non-obvious bit. We can't just trust `sessionId` from the body — a malicious user could send another user's `sessionId` and inject episodes into their conversation.
+
+**The check:** before inserting, run a single `SELECT id FROM sessions WHERE id = $1 AND user_id = $2 LIMIT 1`. If empty, throw `SessionNotFoundError` → controller returns `404`.
+
+I'll use a custom error class (same pattern as `EmailTakenError`/`InvalidCredentialsError`) so the controller maps it cleanly.
+
+Returning **404** (not 403) is deliberate — we don't want to leak whether a sessionId exists for *some* user. Same response whether the session doesn't exist or just isn't yours.
+
+---
+
+### Deferred to Phase D (not in this step)
+
+- No `ingestionQueue.add(...)` call yet — episodes will sit in `status: "queued"` forever until the worker exists.
+- No `processing_logs` writes yet — that's the worker's job.
+- No retry logic / idempotency key — can add later.
+
+So after this step the system "remembers" the message in Postgres but the graph/vector layers are still empty. That's fine — it lets us prove the API surface is right before we touch the queue.
+
+---
+
+### What I expect to test in Postman after
+
+1. Create a session (already works).
+2. `POST /ingest` with that `sessionId`, actor `"user"`, some content → `202 { episodeId, "queued" }`.
+3. `POST /ingest` with a **garbage** `sessionId` → `404`.
+4. `POST /ingest` while logged in as a **different user** using the original `sessionId` → `404` (cross-user isolation).
+5. Verify in Neon that the row exists with `status = "queued"`.
+
+Want me to go ahead and build it?
+
+---
+
+_**User (2026-05-10 08:13:03Z)**_
+
+yes please
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 08:13:45Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:13:56Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { z } from "zod";
+
+export const ingestSchema = z.object({
+  sessionId: z.uuid(),
+  actor: z.enum(["user", "assistant", "system"]),
+  content: z.string().min(1).max(50000),
+  occurredAt: z.iso.datetime().optional(),
+});
+
+export type IngestInput = z.infer<typeof ingestSchema>;
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/validators/ingest.validator.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:14:13Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { and, eq } from "drizzle-orm";
+import { db } from "../models/db";
+import { sessions, episodes } from "../models/schema";
+
+export class SessionNotFoundError extends Error {
+  constructor() {
+    super("SESSION_NOT_FOUND");
+    this.name = "SessionNotFoundError";
+  }
+}
+
+export type EpisodeRow = typeof episodes.$inferSelect;
+
+export type CreateEpisodeInput = {
+  sessionId: string;
+  actor: "user" | "assistant" | "system";
+  content: string;
+  occurredAt?: string;
+};
+
+export async function createEpisode(
+  userId: string,
+  input: CreateEpisodeInput,
+): Promise<EpisodeRow> {
+  const [session] = await db
+    .select({ id: sessions.id })
+    .from(sessions)
+    .where(and(eq(sessions.id, input.sessionId), eq(sessions.userId, userId)))
+    .limit(1);
+
+  if (!session) {
+    throw new SessionNotFoundError();
+  }
+
+  const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
+
+  const [row] = await db
+    .insert(episodes)
+    .values({
+      userId,
+      sessionId: input.sessionId,
+      actor: input.actor,
+      content: input.content,
+      occurredAt,
+    })
+    .returning();
+
+  return row;
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/episodes.service.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:14:21Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import type { Context } from "hono";
+import type { AuthVariables } from "../middleware/auth.middleware";
+import { ingestSchema } from "../validators/ingest.validator";
+import {
+  createEpisode,
+  SessionNotFoundError,
+} from "../services/episodes.service";
+
+export async function ingest(c: Context<{ Variables: AuthVariables }>) {
+  const userId = c.get("userId");
+  const body = await c.req.json().catch(() => null);
+  const parsed = ingestSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "VALIDATION_ERROR", issues: parsed.error.issues },
+      400,
+    );
+  }
+
+  try {
+    const episode = await createEpisode(userId, parsed.data);
+    return c.json(
+      { episodeId: episode.id, status: episode.status },
+      202,
+    );
+  } catch (err) {
+    if (err instanceof SessionNotFoundError) {
+      return c.json({ error: "SESSION_NOT_FOUND" }, 404);
+    }
+    throw err;
+  }
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/controllers/ingest.controller.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:14:30Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { Hono } from "hono";
+import type { AuthVariables } from "../middleware/auth.middleware";
+import { ingest } from "../controllers/ingest.controller";
+
+export const ingestRouter = new Hono<{ Variables: AuthVariables }>();
+
+ingestRouter.post("/", ingest);
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/routes/ingest.routes.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:14:43Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/index.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:14:50Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/index.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:15:07Z)**_
+
+Step 9 done. Files:
+
+- `server/src/validators/ingest.validator.ts:1`
+- `server/src/services/episodes.service.ts:1`
+- `server/src/controllers/ingest.controller.ts:1`
+- `server/src/routes/ingest.routes.ts:1`
+- `server/src/index.ts` — `/ingest` mounted under protected group
+
+**Restart `bun run dev`**, then in Postman:
+
+---
+
+### Request — Ingest a message
+
+| Field | Value |
+|---|---|
+| Method | `POST` |
+| URL | `{{baseUrl}}/ingest` |
+| Auth | inherits Bearer `{{token}}` from collection |
+
+**Body → raw → JSON** (use the `{{sessionId}}` you saved earlier from creating a session):
+```json
+{
+  "sessionId": "{{sessionId}}",
+  "actor": "user",
+  "content": "Hi, my name is Karthik and I work at Anthropic."
+}
+```
+
+Expected `202`:
+```json
+{ "episodeId": "uuid-here", "status": "queued" }
+```
+
+Optional: paste this into the **Tests** tab to save the id for later:
+```js
+const data = pm.response.json();
+pm.collectionVariables.set("episodeId", data.episodeId);
+```
+
+---
+
+### Failure cases to try
+
+| Test | Expected |
+|---|---|
+| Send with no `Authorization` | `401 UNAUTHORIZED` |
+| `sessionId` = random valid UUID that isn't yours | `404 SESSION_NOT_FOUND` |
+| `actor: "robot"` | `400 VALIDATION_ERROR` |
+| `content: ""` | `400 VALIDATION_ERROR` |
+| Drop `sessionId` field | `400 VALIDATION_ERROR` |
+| `occurredAt: "yesterday"` (not ISO) | `400 VALIDATION_ERROR` |
+| `occurredAt: "2026-05-10T10:00:00Z"` | `202` (and the row will have that timestamp, not `now`) |
+
+---
+
+### Verify in the database
+
+After a successful ingest, in your Neon SQL console:
+```sql
+SELECT id, actor, content, status, occurred_at, processed_at
+FROM episodes
+ORDER BY created_at DESC
+LIMIT 5;
+```
+
+Every row should have `status = 'queued'` and `processed_at = NULL`. They'll stay that way until we add the worker in Phase D — which is exactly what we want right now.
+
+Once you confirm ingest works, next up is **Step 10 — `GET /episodes/:id` (inspect endpoint)** before we move into Redis/BullMQ.
+
+---
+
+_**User (2026-05-10 08:16:33Z)**_
+
+**Yes, exactly.**  
+
+The original **Zep / Graphiti** system **does handle conflicting statements automatically** — but not by deleting the old fact. It uses a smart **temporal invalidation** mechanism.
+
+### How It Works in Simple Terms
+
+**Example:**
+
+1. First message:  
+   **"I like dogs"**
+
+   → Graphiti creates a fact:  
+   `User LIKES Dogs`  
+   with `valid_from: [that date]` → `valid_until: null` (still true)
+
+2. Later message:  
+   **"Actually, I like cats more now"** (or "I don't like dogs anymore")
+
+   → The system detects this as a **contradiction** on the same relationship (User's preference).
+
+   → It does **not delete** the old fact.  
+   → Instead, it **invalidates** the old edge by setting `valid_until` to the time when the new statement was made.  
+   → Then adds the new fact: `User LIKES Cats` with its own `valid_from`.
+
+### What Happens Behind the Scenes
+
+- During fact extraction, Graphiti uses an **LLM** to compare the new fact with existing similar facts between the samIf it finds a conflict (especially with overlapping time), it marks the old fact as expired.
+- The graph now knows:
+  - In the past → User liked dogs
+  - Currently → User likes cats
+
+This is one of the **biggest strengths** of Graphiti compared to normal RAG or simple vector stores.
+
+---
+
+### In Your Own Implementation (Bun + Neo4j)
+
+You should implement similar logic in your ingestion worker:
+
+1. When extracting a new fact → Check for existing facts between the same two entities (same `relationType`).
+2. Use an LLM (or simple rules) to detect if it's a contradiction or update.
+3. If conflicting:
+   - Set `valid_until` on the old relationship to the new fact's `valid_from` time.
+   - Create the new relationship.
+
+**Cypher Example (Simplified):**
+
+```cypher
+// Invalidate old conflicting fact
+MATCH (a:Entity)-[old:FACT {relationType: $relationType}]->(b:Entity)
+WHERE old.validUntil IS NULL 
+  AND a.entityId = $sourceId
+SET old.validUntil = $newValidFrom;
+
+// Create new fact
+MERGE (a)-[new:FACT {
+    fac $newFactText,
+    validFrom: $newValidFrom,
+    validUntil: null
+}]->(b);
+```
+
+---
+
+**Summary:**
+
+- Yes, it **auto-updates** on conflicting info.
+- It keeps **full history** (non-lossy).
+- It uses **time validity** (`valid_from` / `valid_until`) to know what is current vs historical.
+- This allows powerful temporal reasoning like “What did the user like before June 2025?”
+
+Would you like me to show you how to implement this **conflict detection + invalidation** step inside your BullMQ worker? add this to the plan workflow too and memory so we build the main ingest keeping this in mind
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 08:18:15Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:18:16Z)**_
+
+Saving the pattern to memory and updating PLAN.md so it's part of the design we build to.
+
+_**Agent (claude-opus-4-7 2026-05-10 08:18:24Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```md
+---
+name: Temporal invalidation pattern (Graphiti-style)
+description: How the ingestion worker must handle contradicting facts — close out old edges by setting validUntil, never delete; preserves full history
+type: project
+---
+
+When the worker extracts a new fact and a contradicting open-ended edge already exists in Neo4j (same source entity + `relationType`, `validUntil IS NULL`), it must **not delete** the old edge. It sets the old edge's `validUntil = newFact.validFrom` and creates the new edge with its own `validFrom`, `validUntil = NULL`.
+
+**Why:** This is *the* differentiator from a normal RAG/vector store. It preserves full history (non-lossy), enables temporal queries like "what did the user believe in March?" vs "what's true now?", and matches Zep/Graphiti's published behavior. Without it, "I like cats now" would silently overwrite "I liked dogs in 2024."
+
+**How to apply:** In the BullMQ worker pipeline, between fact extraction and Neo4j writes, insert a contradiction-detection pass:
+
+1. For each new fact, MATCH existing `(:Entity {entityId: $sourceId})-[:FACT {relationType, validUntil: NULL}]->(:Entity)`.
+2. SET those edges' `validUntil = newFact.validFrom`.
+3. MERGE the new edge.
+
+Pinecone fact vectors must mirror `validUntil` so the vector layer can do coarse temporal pruning. All retrieval queries always filter `coalesce(validUntil, '9999-01-01') >= now AND validFrom <= now` for "current" facts; drop the filter to walk history.
+
+**Edge cases to handle when implementing:**
+- **Re-affirmations** ("I still like dogs") — don't create a duplicate; bump `confidence` or skip.
+- **Predicate ambiguity** ("loves" vs "likes") — pure rules will miss; needs an LLM disambiguation step.
+- **Partial contradictions** ("I love dogs" → "I love dogs but cats more") — keep both edges with overlapping validity rather than invalidating.
+- **New fact with different target** ("liked dogs" → "likes cats") — scope conflict detection by `source + relationType`, **not** `source + target`, otherwise the old edge stays open forever.
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/.claude/projects/-Users-karthiknadar-Desktop-zep-paper-implementation/memory/temporal_invalidation_pattern.md (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:18:38Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```md
+- [Project overview](project_overview.md) — Zep-paper memory system: Bun/Hono + Neon Postgres + Pinecone + Neo4j + BullMQ; fast-path write, background extraction, hybrid retrieval
+- [Temporal invalidation pattern](temporal_invalidation_pattern.md) — worker must close old fact edges with `validUntil`, never delete; preserves full history (Graphiti behavior)
+
+```
+
+```text
+The file /Users/karthiknadar/.claude/projects/-Users-karthiknadar-Desktop-zep-paper-implementation/MEMORY.md has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:18:42Z)**_
+
+Now updating PLAN.md — adding a temporal-invalidation block under Layer 2, making the worker step explicit, and adding the rules-vs-LLM decision to open questions.
+
+_**Agent (claude-opus-4-7 2026-05-10 08:18:53Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>File does not exist. Note: your current working directory is /Users/karthiknadar/Desktop/zep-paper-implementation/server. Did you mean /Users/karthiknadar/Desktop/zep-paper-implementation/server/PLAN.md?</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:18:58Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:19:00Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Find which PLAN.md exists
+
+`ls -la /Users/karthiknadar/Desktop/zep-paper-implementation/PLAN.md /Users/karthiknadar/Desktop/zep-paper-implementation/server/PLAN.md 2>&1`
+
+```text
+Exit code 1
+ls: /Users/karthiknadar/Desktop/zep-paper-implementation/PLAN.md: No such file or directory
+-rw-r--r--@ 1 karthiknadar  staff  12183 May 10 13:00 /Users/karthiknadar/Desktop/zep-paper-implementation/server/PLAN.md
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:19:04Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:19:04Z)**_
+
+PLAN.md lives in `server/` not project root. Retrying with the right path.
+
+_**Agent (claude-opus-4-7 2026-05-10 08:19:11Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:19:13Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./server/PLAN.md`
+
+```text
+1	# Zep-style Memory System — Implementation Plan
+2	
+3	A practical implementation of the Zep paper: a temporal knowledge-graph backed memory layer for LLM agents. Episodes (raw messages) are captured immutably, then a background pipeline distills them into entities, time-stamped facts, and community summaries that an agent can query through hybrid (vector + graph) retrieval.
+4	
+5	---
+6	
+7	## 1. Stack
+8	
+9	| Layer | Choice | Purpose |
+10	|---|---|---|
+11	| API | **Bun + Hono** (port 3002) | Thin, fast HTTP layer |
+12	| Relational | **Neon Postgres** + Drizzle ORM | Durable raw episode store, auth, audit trail |
+13	| Vector | **Pinecone** | Semantic recall over entities + facts |
+14	| Graph | **Neo4j** | Temporal knowledge graph (3 subgraphs) |
+15	| Queue | **BullMQ** on **Redis** (`ioredis`) | Background extraction pipeline |
+16	| LLM | **OpenAI** (`openai` package) | Entity + fact + temporal extraction, optional reranker |
+17	| Validation | **Zod** | Request/response schemas |
+18	| Auth | Email + password (basic, no OAuth) | Tenancy boundary |
+19	
+20	---
+21	
+22	## 2. The two-path architecture
+23	
+24	The system splits work into a fast write path and a slower read path. The user-facing API never blocks on LLM calls.
+25	
+26	```
+27	                       ┌─────────────────────────────────┐
+28	                       │           USER / CLIENT          │
+29	                       └──────────────┬──────────────────┘
+30	                                      │
+31	                ┌─────────────────────┼─────────────────────┐
+32	                │ POST /ingest                              │ POST /retrieve
+33	                ▼                                           ▼
+34	        ┌───────────────┐                          ┌────────────────┐
+35	        │  Hono route   │                          │  Hono route    │
+36	        └───────┬───────┘                          └────────┬───────┘
+37	                │ 1. insert episode (Postgres)              │
+38	                │ 2. enqueue BullMQ job                     │
+39	                │ 3. return 202 { episodeId }               │
+40	                ▼                                           │
+41	        ┌───────────────────────┐                           ▼
+42	        │ BullMQ worker         │                  ┌────────────────┐
+43	        │ (memory-ingestion)    │                  │ memoryRetrieval │
+44	        │                       │                  │   .getContext()  │
+45	        │  LLM extract entities │                  │                │
+46	        │  → resolve entities   │                  │  Pinecone      │
+47	        │  → LLM extract facts  │                  │  → Neo4j hops  │
+48	        │  → temporal stamps    │                  │  → temporal    │
+49	        │  → write Neo4j        │                  │    filter      │
+50	        │  → upsert Pinecone    │                  │  → rerank      │
+51	        │  → update status PG   │                  │  → build text  │
+52	        └───────────────────────┘                  └────────────────┘
+53	```
+54	
+55	---
+56	
+57	## 3. Storage layers — what lives where
+58	
+59	| Store | Holds | Why this and not another |
+60	|---|---|---|
+61	| **Postgres** | `users`, `sessions`, `episodes` (raw), `processing_logs` | Durability + relational queries. If everything else burns down, no message is lost. |
+62	| **Neo4j** | `:Episode`, `:Entity`, `:Community` nodes; `:MENTIONS`, `:FACT`, `:CONTAINS` edges | Multi-hop traversal + temporal filtering. SQL would need recursive CTEs and is awkward for this. |
+63	| **Pinecone** | One vector per entity, one per fact. Metadata: `type`, `userId`, `neo4jId` | Semantic match. Graph alone misses paraphrases. |
+64	| **Redis (BullMQ)** | Job queues, retries, optional retrieval cache | Decouples API latency from LLM latency. |
+65	
+66	Mental model: **Postgres is durability, Neo4j is structure-and-time, Pinecone is similarity, BullMQ is patience.**
+67	
+68	---
+69	
+70	## 4. Neo4j — the three-subgraph design
+71	
+72	Not three databases. **One graph, three logical layers** distinguished by node label.
+73	
+74	### Layer 1 — Episode subgraph (raw)
+75	```cypher
+76	CREATE (e:Episode {
+77	  episodeId, content, actor, timestamp, userId, sessionId, createdAt
+78	})
+79	MATCH (e:Episode {episodeId: $episodeId})
+80	MATCH (ent:Entity {entityId: $entityId})
+81	CREATE (e)-[:MENTIONS { role: "source", timestamp: $timestamp }]->(ent)
+82	```
+83	Bottom layer. One `:Episode` per raw message. Connects to entities via `:MENTIONS`.
+84	
+85	### Layer 2 — Semantic Entity subgraph (the meat)
+86	```cypher
+87	MERGE (ent:Entity { entityId: $entityId })
+88	SET ent.name = $name,
+89	    ent.type = $type,           -- PERSON, COMPANY, CONCEPT, ...
+90	    ent.summary = $summary,
+91	    ent.userId = $userId,
+92	    ent.updatedAt = datetime()
+93	
+94	MATCH (a:Entity { entityId: $sourceId })
+95	MATCH (b:Entity { entityId: $targetId })
+96	MERGE (a)-[f:FACT {
+97	  factId: $factId,
+98	  relationType: $relationType,  -- WORKS_AT, LIKES, FRIENDS_WITH, ...
+99	  factText: $factText,
+100	  validFrom: $validFrom,
+101	  validUntil: $validUntil,      -- null/∞ until contradicted
+102	  confidence: $confidence,
+103	  episodeId: $episodeId
+104	}]->(b)
+105	```
+106	Middle layer. `:Entity` nodes deduplicated by entity-resolver. `:FACT` edges carry **bi-temporal** properties (`validFrom`/`validUntil`) — the property that makes the system "Zep-like."
+107	
+108	### Layer 3 — Community subgraph (summaries)
+109	```cypher
+110	MERGE (c:Community { communityId: $communityId })
+111	SET c.name = $name,
+112	    c.summary = $summary,
+113	    c.userId = $userId,
+114	    c.updatedAt = datetime()
+115	
+116	MATCH (c:Community { communityId: $communityId })
+117	MATCH (e:Entity { entityId: $entityId })
+118	MERGE (c)-[:CONTAINS]->(e)
+119	```
+120	Top layer. Built periodically by a low-priority queue. Used to inject "context about who/what this conversation is broadly about" into retrieval.
+121	
+122	### Connection picture
+123	```
+124	Episode  ──MENTIONS──▶  Entity  ──FACT──▶  Entity
+125	                          ▲
+126	                          │ CONTAINS
+127	                       Community
+128	```
+129	
+130	---
+131	
+132	## 5. Postgres schema
+133	
+134	All tables scope by `userId` for tenancy.
+135	
+136	| Table | Columns | Role |
+137	|---|---|---|
+138	| `users` | `id`, `email` (unique), `password_hash`, `created_at` | Auth |
+139	| `sessions` | `id`, `user_id` (FK→users), `title`, `created_at` | Conversation grouping |
+140	| `episodes` | `id`, `user_id`, `session_id`, `actor` (enum), `content`, `status` (enum), `metadata` (jsonb), `occurred_at`, `created_at`, `processed_at` | Raw immutable log + worker status |
+141	| `processing_logs` | `id`, `episode_id` (FK), `step`, `status`, `message`, `duration_ms`, `created_at` | Per-step pipeline audit trail |
+142	
+143	Enums:
+144	- `actor`: `user | assistant | system`
+145	- `episode_status`: `queued | processing | processed | failed`
+146	
+147	Indexes:
+148	- `episodes (user_id, session_id, occurred_at)` — for "last N messages of session"
+149	- `episodes (status)` — for worker retry/inspection
+150	- `sessions (user_id)`
+151	- `processing_logs (episode_id)`
+152	
+153	---
+154	
+155	## 6. Pinecone index design
+156	
+157	- **One index** (single embedder dimension), distinguished by metadata.
+158	- Required metadata on every vector: `userId`, `type` (`"entity" | "fact"`), `neo4jId`, `episodeId`.
+159	- Optional: `validFrom`, `validUntil` mirrored on fact vectors so coarse temporal pruning happens at the vector layer too.
+160	- Query filter is always `{ userId: $uid, ... }` — never run an unfiltered query.
+161	
+162	---
+163	
+164	## 7. Auth
+165	
+166	Basic — focus on the core workflow, not auth ceremony.
+167	
+168	- `POST /auth/signup` → email + password → bcrypt hash → row in `users` → return JWT
+169	- `POST /auth/login` → verify hash → return JWT
+170	- All ingest/retrieve routes require a Bearer JWT; `userId` is derived from the token, never trusted from the body.
+171	
+172	---
+173	
+174	## 8. Ingestion pipeline (worker)
+175	
+176	`POST /ingest { sessionId, actor, content, occurredAt? }`:
+177	
+178	1. Hono route inserts an `episodes` row (status=`queued`, `occurred_at` = client-provided or server-now).
+179	2. `ingestionQueue.add("process-episode", { episodeId })` with `attempts: 3`, exponential backoff.
+180	3. Return `202 { episodeId, status: "queued" }`.
+181	
+182	Worker (separate Bun process) picks up the job:
+183	
+184	| Step | Action | Writes |
+185	|---|---|---|
+186	| 1 | Mark episode `processing` | Postgres |
+187	| 2 | Fetch episode + last 6 messages of session | Postgres read |
+188	| 3 | LLM call: extract raw entities | — |
+189	| 4 | Entity resolver: dedupe against existing `:Entity` nodes scoped to `userId` | Neo4j read |
+190	| 5 | LLM call: extract facts between resolved entities | — |
+191	| 6 | Temporal annotation: `validFrom`, `validUntil` (invalidate contradicted facts) | — |
+192	| 7 | `Promise.all`: write Neo4j, upsert Pinecone, mark episode `processed` | Neo4j + Pinecone + Postgres |
+193	| 8 | If threshold hit, enqueue `community-update` for this user | Redis |
+194	
+195	Each step writes a row to `processing_logs` with `duration_ms`.
+196	
+197	Failures retry per BullMQ; final failure marks episode `failed` and lands in a DLQ.
+198	
+199	---
+200	
+201	## 9. Retrieval pipeline
+202	
+203	`POST /retrieve { sessionId?, query, limit? }`:
+204	
+205	1. Embed query (OpenAI).
+206	2. `pinecone.query({ filter: { userId } }, topK: 20–30)` — returns entity + fact vectors.
+207	3. From those `neo4jId`s, run a 1–2 hop Neo4j traversal **with temporal filter** `WHERE coalesce(f.validUntil, datetime('9999-01-01')) >= now AND f.validFrom <= now`.
+208	4. Optionally pull the user's most relevant `:Community` summaries via `[:CONTAINS]`.
+209	5. Rerank: weighted blend of `vector_score`, `graph_proximity`, `recency`. Optional LLM reranker on top-K.
+210	6. Build context: facts with their date ranges + last 3–5 raw messages from Postgres for grounding.
+211	7. Return ~1–3k tokens.
+212	
+213	---
+214	
+215	## 10. API surface (initial)
+216	
+217	| Method | Path | Purpose |
+218	|---|---|---|
+219	| POST | `/auth/signup` | Create account |
+220	| POST | `/auth/login` | Get JWT |
+221	| POST | `/sessions` | Create a session |
+222	| GET  | `/sessions` | List user's sessions |
+223	| POST | `/ingest` | Submit a message (returns 202) |
+224	| GET  | `/episodes/:id` | Inspect an episode + its processing log |
+225	| POST | `/retrieve` | Get hybrid context for a query |
+226	
+227	---
+228	
+229	## 11. Phased build order
+230	
+231	1. **Schema + migrations** — `users`, `sessions`, `episodes`, `processing_logs`. ✅ in progress
+232	2. **Auth** — signup, login, JWT middleware.
+233	3. **Session + ingest routes** (return 202; no worker yet — episode just sits in `queued`).
+234	4. **BullMQ + Redis** — queue setup + worker harness, no LLM yet.
+235	5. **Neo4j service** — driver, episode/entity/fact write helpers, indices on `entityId`/`userId`.
+236	6. **OpenAI extraction** — entity prompt, fact prompt, temporal prompt; structured output via Zod.
+237	7. **Entity resolver** — dedupe pass against Neo4j scoped to user.
+238	8. **Pinecone service** — embed + upsert with metadata.
+239	9. **Wire the worker** — full pipeline end to end on a single test episode.
+240	10. **Retrieval service** — Pinecone → Neo4j expansion → temporal filter → rerank → context build.
+241	11. **Communities** — periodic clustering + summary, low-priority queue.
+242	12. **Observability** — BullMQ UI, processing-log dashboard, simple metrics.
+243	
+244	---
+245	
+246	## 12. Open decisions to revisit
+247	
+248	- **Bi-temporal vs uni-temporal.** Currently planning event-time only (`validFrom`/`validUntil`). Zep's paper also tracks transaction time (when system *learned* a fact). Adding it later means a graph migration — decide before step 5.
+249	- **Worker process model.** Same Bun process or `bun run workers/index.ts` separately. Lean toward separate for restart isolation.
+250	- **Community cadence.** Every N episodes per user vs debounced timer. Lean toward N=20 with a per-user lock.
+251	- **Pinecone single-index vs namespaces.** Going single-index + metadata filter. Revisit if cross-user volume becomes asymmetric.
+252	- **JWT vs session cookies.** Going JWT for simplicity since there's no browser session story yet.
+253
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:19:53Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/PLAN.md has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:20:05Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/PLAN.md has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:20:12Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/PLAN.md has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:20:23Z)**_
+
+Done. Summary:
+
+**PLAN.md (`server/PLAN.md`)** — three updates:
+- Section 4 (Layer 2): added a **"Temporal invalidation (the Graphiti pattern)"** subsection with the close-old-edge cypher and the four edge cases (re-affirmation, predicate ambiguity, partial contradiction, different target).
+- Section 8 (Worker pipeline): replaced the single "step 6" with **6a (contradiction detection)** and **6b (temporal annotation + invalidation)**, and updated step 7 to call out that Pinecone fact vectors mirror `validFrom`/`validUntil`.
+- Section 12 (Open decisions): added **"Contradiction detection — rules or LLM?"** with the rules-first-then-LLM-disambiguation default.
+
+**Memory** — saved as a project memory:
+- `temporal_invalidation_pattern.md` — the rule, why it matters (the Zep/Graphiti differentiator), how to apply in the worker, and the same edge-case list.
+- Indexed in `MEMORY.md`.
+
+So future-me reading either the plan or memory before building the worker will know: **close old edges with `validUntil`, never delete; scope conflict detection by source + relationType, not source + target.**
+
+Ready for **Step 10 (`GET /episodes/:id`)** when you want to keep going.
+
+---
+
+_**User (2026-05-10 08:20:30Z)**_
+
+yes please
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 08:21:04Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 08:21:05Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./server/src/services/episodes.service.ts`
+
+```text
+1	import { and, eq } from "drizzle-orm";
+2	import { db } from "../models/db";
+3	import { sessions, episodes } from "../models/schema";
+4	
+5	export class SessionNotFoundError extends Error {
+6	  constructor() {
+7	    super("SESSION_NOT_FOUND");
+8	    this.name = "SessionNotFoundError";
+9	  }
+10	}
+11	
+12	export type EpisodeRow = typeof episodes.$inferSelect;
+13	
+14	export type CreateEpisodeInput = {
+15	  sessionId: string;
+16	  actor: "user" | "assistant" | "system";
+17	  content: string;
+18	  occurredAt?: string;
+19	};
+20	
+21	export async function createEpisode(
+22	  userId: string,
+23	  input: CreateEpisodeInput,
+24	): Promise<EpisodeRow> {
+25	  const [session] = await db
+26	    .select({ id: sessions.id })
+27	    .from(sessions)
+28	    .where(and(eq(sessions.id, input.sessionId), eq(sessions.userId, userId)))
+29	    .limit(1);
+30	
+31	  if (!session) {
+32	    throw new SessionNotFoundError();
+33	  }
+34	
+35	  const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
+36	
+37	  const [row] = await db
+38	    .insert(episodes)
+39	    .values({
+40	      userId,
+41	      sessionId: input.sessionId,
+42	      actor: input.actor,
+43	      content: input.content,
+44	      occurredAt,
+45	    })
+46	    .returning();
+47	
+48	  return row;
+49	}
+50
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:21:24Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/episodes.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:21:35Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/episodes.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:21:45Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import type { Context } from "hono";
+import { z } from "zod";
+import type { AuthVariables } from "../middleware/auth.middleware";
+import {
+  getEpisodeWithLogs,
+  EpisodeNotFoundError,
+} from "../services/episodes.service";
+
+export async function getEpisode(c: Context<{ Variables: AuthVariables }>) {
+  const userId = c.get("userId");
+  const idParam = c.req.param("id");
+  const parsed = z.uuid().safeParse(idParam);
+  if (!parsed.success) {
+    return c.json({ error: "INVALID_ID" }, 400);
+  }
+
+  try {
+    const { episode, logs } = await getEpisodeWithLogs(userId, parsed.data);
+    return c.json({ episode, logs });
+  } catch (err) {
+    if (err instanceof EpisodeNotFoundError) {
+      return c.json({ error: "EPISODE_NOT_FOUND" }, 404);
+    }
+    throw err;
+  }
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/controllers/episodes.controller.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:21:50Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { Hono } from "hono";
+import type { AuthVariables } from "../middleware/auth.middleware";
+import { getEpisode } from "../controllers/episodes.controller";
+
+export const episodesRouter = new Hono<{ Variables: AuthVariables }>();
+
+episodesRouter.get("/:id", getEpisode);
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/routes/episodes.routes.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:21:57Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/index.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:22:01Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/index.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 08:22:16Z)**_
+
+Step 10 done. Files:
+
+- `server/src/services/episodes.service.ts` — added `EpisodeNotFoundError`, `ProcessingLogRow` type, `getEpisodeWithLogs(userId, episodeId)`
+- `server/src/controllers/episodes.controller.ts:1`
+- `server/src/routes/episodes.routes.ts:1`
+- `server/src/index.ts` — `/episodes` mounted under protected group
+
+**Restart `bun run dev`**, then in Postman:
+
+---
+
+### Request — Inspect episode
+
+| Field | Value |
+|---|---|
+| Method | `GET` |
+| URL | `{{baseUrl}}/episodes/{{episodeId}}` |
+| Auth | inherits Bearer `{{token}}` |
+
+Use the `episodeId` Postman captured from your last `/ingest` call.
+
+Expected `200`:
+```json
+{
+  "episode": {
+    "id": "uuid",
+    "userId": "uuid",
+    "sessionId": "uuid",
+    "actor": "user",
+    "content": "Hi, my name is Karthik...",
+    "status": "queued",
+    "metadata": null,
+    "occurredAt": "2026-05-10T...",
+    "createdAt": "2026-05-10T...",
+    "processedAt": null
+  },
+  "logs": []
+}
+```
+
+`logs: []` for now — empty until the worker exists. After Phase D, you'll see one row per pipeline step with `step`, `status`, `durationMs`.
+
+---
+
+### Failure cases to try
+
+| Test | Expected |
+|---|---|
+| No `Authorization` header | `401 UNAUTHORIZED` |
+| `:id` = `not-a-uuid` | `400 INVALID_ID` |
+| `:id` = a real UUID that doesn't exist | `404 EPISODE_NOT_FOUND` |
+| `:id` = another user's episode UUID | `404 EPISODE_NOT_FOUND` (same — no enumeration leak) |
+
+---
+
+**Phase C is now complete.** Full API surface so far:
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/auth/signup` | Create account |
+| POST | `/auth/login` | Get JWT |
+| GET | `/me` | Smoke test |
+| POST | `/sessions` | Create session |
+| GET | `/sessions` | List my sessions |
+| POST | `/ingest` | Submit message → 202 queued |
+| GET | `/episodes/:id` | Inspect episode + logs |
+
+Next is **Phase D — Redis + BullMQ + worker harness**. The worker won't do LLM work yet — it'll just transition `queued → processing → processed`, prove the queue plumbing works, and write rows to `processing_logs`. Want to keep going to Step 11 (Redis decision) and Step 12 (queue setup)?
