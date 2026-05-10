@@ -2,7 +2,14 @@
   "name": "server",
   "scripts": {
     "dev": "bun run --hot src/index.ts",
-    "worker": "bun run --hot src/workers/ingestion.worker.ts"
+    "worker": "bun run --hot src/workers/ingestion.worker.ts",
+    "test:extraction": "bun run scripts/test-extraction.ts",
+    "init:neo4j": "bun run scripts/init-neo4j.ts",
+    "test:neo4j": "bun run scripts/test-neo4j.ts",
+    "test:resolver": "bun run scripts/test-resolver.ts",
+    "test:facts": "bun run scripts/test-fact-extraction.ts",
+    "test:temporal": "bun run scripts/test-temporal.ts",
+    "test:pinecone": "bun run scripts/test-pinecone.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
