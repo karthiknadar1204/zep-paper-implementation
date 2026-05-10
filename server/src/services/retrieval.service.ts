@@ -1,6 +1,8 @@
+import { z } from "zod";
 import { queryVectors } from "./pinecone.service";
 import { expandFromIds, type ExpandedFact } from "./neo4j.service";
 import { getRecentMessages, type RecentMessage } from "./episodes.service";
+import { openai } from "../utils/openai";
 
 export type RetrievalOptions = {
   userId: string;
@@ -9,16 +11,19 @@ export type RetrievalOptions = {
   asOf?: string;
   limit?: number;
   vectorTopK?: number;
+  minVectorScore?: number;
 };
 
 export type ScoredFact = ExpandedFact & {
   vectorScore: number;
   recencyScore: number;
   hopScore: number;
+  llmScore?: number;
   totalScore: number;
 };
 
 export type RetrievalResult = {
+  answer: string;
   context: string;
   facts: ScoredFact[];
   recentMessages: RecentMessage[];
@@ -30,6 +35,156 @@ const RECENT_MESSAGE_TAIL = 5;
 const WEIGHT_VECTOR = 0.6;
 const WEIGHT_RECENCY = 0.25;
 const WEIGHT_HOP = 0.15;
+
+const DEFAULT_MIN_VECTOR_SCORE = 0.3;
+
+const LLM_RERANK_MODEL = "gpt-4o-mini";
+const LLM_RERANK_INPUT_CAP = 20;
+
+const LLM_RERANK_SYSTEM = `You are reranking facts retrieved from a knowledge graph by relevance to a user query.
+
+For each candidate fact, judge how directly it answers or informs the query.
+
+Score guide:
+- 0.9–1.0: directly answers the query
+- 0.6–0.8: strong supporting context
+- 0.3–0.5: tangentially related
+- 0.0–0.2: not relevant — DROP
+
+Drop irrelevant facts entirely. Return ONLY the relevant ones, ordered most-to-least relevant.
+
+Return JSON exactly: { "ranked": [ { "factId": string, "score": number } ] }`;
+
+const LlmRerankResponseSchema = z.object({
+  ranked: z.array(
+    z.object({
+      factId: z.string(),
+      score: z.number().min(0).max(1),
+    }),
+  ),
+});
+
+const LLM_ANSWER_SYSTEM = `You are a memory assistant. Given retrieved facts about the user and the recent conversation, write a concise direct answer to the user's query.
+
+Rules:
+- 1-3 sentences. Plain prose, no preamble, no markdown, no bullet points.
+- Use ONLY the facts and messages provided. Do NOT invent details.
+- If a fact has a date range, you may reference time naturally ("the user used to..." for closed facts).
+- If nothing relevant is provided, reply exactly: "I don't have information about that yet."
+- Refer to the speaker as "the user" or "you" — match the framing the query uses.`;
+
+async function llmAnswer(
+  query: string,
+  facts: ScoredFact[],
+  recent: RecentMessage[],
+): Promise<string> {
+  const factsBlock =
+    facts.length === 0
+      ? "(no relevant facts)"
+      : facts
+          .map((f) => {
+            const since = f.validFrom.slice(0, 10);
+            const until = f.validUntil ? f.validUntil.slice(0, 10) : null;
+            const range = until ? `from ${since} to ${until}` : `since ${since}`;
+            return `- ${f.factText} (${range})`;
+          })
+          .join("\n");
+
+  const recentBlock =
+    recent.length === 0
+      ? "(no recent messages)"
+      : recent
+          .map((m) => `> [${m.actor}] ${m.content}`)
+          .join("\n");
+
+  const userPrompt = `Query: ${query}
+
+Relevant facts:
+${factsBlock}
+
+Recent conversation:
+${recentBlock}`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: LLM_RERANK_MODEL,
+      messages: [
+        { role: "system", content: LLM_ANSWER_SYSTEM },
+        { role: "user", content: userPrompt },
+      ],
+    });
+    const text = completion.choices[0]?.message?.content?.trim();
+    return text || "(unable to generate answer)";
+  } catch (err) {
+    console.error(
+      "[retrieval] LLM answer synthesis failed:",
+      err instanceof Error ? err.message : err,
+    );
+    return "(unable to generate answer)";
+  }
+}
+
+async function llmRerank(
+  query: string,
+  candidates: ScoredFact[],
+): Promise<ScoredFact[]> {
+  if (candidates.length === 0) return candidates;
+
+  const input = candidates.slice(0, LLM_RERANK_INPUT_CAP);
+  const candidatesBlock = input
+    .map(
+      (f, i) =>
+        `${i + 1}. [${f.factId}] ${f.sourceName} -[${f.relationType}]-> ${f.targetName}: "${f.factText}"`,
+    )
+    .join("\n");
+
+  const userPrompt = `Query: ${query}
+
+Candidates:
+${candidatesBlock}`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: LLM_RERANK_MODEL,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: LLM_RERANK_SYSTEM },
+        { role: "user", content: userPrompt },
+      ],
+    });
+
+    const raw = completion.choices[0]?.message?.content;
+    if (!raw) return candidates;
+
+    const json = JSON.parse(raw);
+    const validated = LlmRerankResponseSchema.parse(json);
+
+    const byId = new Map(input.map((c) => [c.factId, c]));
+    const reranked: ScoredFact[] = [];
+    const seen = new Set<string>();
+
+    for (const r of validated.ranked) {
+      if (seen.has(r.factId)) continue;
+      const fact = byId.get(r.factId);
+      if (!fact) continue;
+      seen.add(r.factId);
+      reranked.push({
+        ...fact,
+        llmScore: r.score,
+        totalScore: r.score,
+      });
+    }
+
+    reranked.sort((a, b) => (b.llmScore ?? 0) - (a.llmScore ?? 0));
+    return reranked;
+  } catch (err) {
+    console.error(
+      "[retrieval] LLM rerank failed; falling back to score-based order:",
+      err instanceof Error ? err.message : err,
+    );
+    return candidates;
+  }
+}
 
 function computeRecencyScore(validFrom: string, asOf: string): number {
   const ageMs =
@@ -80,6 +235,7 @@ export async function getContext(
   const { userId, query, sessionId } = opts;
   const limit = opts.limit ?? 10;
   const vectorTopK = opts.vectorTopK ?? 25;
+  const minVectorScore = opts.minVectorScore ?? DEFAULT_MIN_VECTOR_SCORE;
   const asOf = opts.asOf ?? new Date().toISOString();
 
   const matches = await queryVectors(query, userId, vectorTopK);
@@ -125,14 +281,19 @@ export async function getContext(
     };
   });
 
-  scored.sort((a, b) => b.totalScore - a.totalScore);
-  const topFacts = scored.slice(0, limit);
+  const filtered = scored.filter((f) => f.vectorScore >= minVectorScore);
+  filtered.sort((a, b) => b.totalScore - a.totalScore);
+
+  const reranked = await llmRerank(query, filtered);
+
+  const topFacts = reranked.slice(0, limit);
 
   const recentMessages = sessionId
     ? await getRecentMessages(sessionId, RECENT_MESSAGE_TAIL)
     : [];
 
   const context = formatContext(topFacts, recentMessages, asOf);
+  const answer = await llmAnswer(query, topFacts, recentMessages);
 
-  return { context, facts: topFacts, recentMessages, asOf };
+  return { answer, context, facts: topFacts, recentMessages, asOf };
 }

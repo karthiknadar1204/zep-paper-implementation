@@ -62,8 +62,21 @@ async function step<T>(
   }
 }
 
+function tag(episodeId: string): string {
+  return `[${episodeId.slice(0, 8)}]`;
+}
+
+function nameById(
+  list: Array<{ entityId: string; name: string }>,
+  id: string,
+): string {
+  return list.find((e) => e.entityId === id)?.name ?? "?";
+}
+
 async function processEpisode(job: Job<IngestionJobData>) {
   const { episodeId } = job.data;
+  const t = tag(episodeId);
+  const startedAt = Date.now();
 
   await db
     .update(episodes)
@@ -75,19 +88,42 @@ async function processEpisode(job: Job<IngestionJobData>) {
     if (!ep) throw new Error("episode not found");
     return ep;
   });
+  const preview =
+    episode.content.length > 70
+      ? `${episode.content.slice(0, 70)}...`
+      : episode.content;
+  console.log(`${t} start "${preview}"`);
 
   const recent = await step(episodeId, "fetch_recent", () =>
     getRecentMessages(episode.sessionId, 6, episodeId),
   );
+  console.log(`${t} recent: ${recent.length} prior message(s) loaded`);
 
   const currentMsg = { actor: episode.actor, content: episode.content };
 
   const rawEntities = await step(episodeId, "extract_entities", () =>
     extractEntities(currentMsg, recent),
   );
+  console.log(
+    `${t} extracted ${rawEntities.length} entit${rawEntities.length === 1 ? "y" : "ies"}: ${
+      rawEntities.length === 0
+        ? "(none)"
+        : rawEntities.map((e) => `${e.name}[${e.type}]`).join(", ")
+    }`,
+  );
 
   const resolved = await step(episodeId, "resolve_entities", () =>
     resolveEntities(episode.userId, rawEntities),
+  );
+  const newCount = resolved.filter((r) => r.isNew).length;
+  console.log(
+    `${t} resolved ${resolved.length} (${newCount} new): ${
+      resolved.length === 0
+        ? "(none)"
+        : resolved
+            .map((r) => `${r.name}${r.isNew ? "*" : ""}`)
+            .join(", ")
+    }`,
   );
 
   const self = await step(episodeId, "get_self_entity", () =>
@@ -98,6 +134,28 @@ async function processEpisode(job: Job<IngestionJobData>) {
 
   const factsResult = await step(episodeId, "extract_facts", () =>
     extractFacts(currentMsg, recent, allEntities),
+  );
+  const factsLine =
+    factsResult.facts.length === 0
+      ? "(none)"
+      : factsResult.facts
+          .map(
+            (f) =>
+              `${nameById(allEntities, f.sourceEntityId)}-${f.relationType}->${nameById(allEntities, f.targetEntityId)}`,
+          )
+          .join(", ");
+  const invLine =
+    factsResult.invalidations.length === 0
+      ? "(none)"
+      : factsResult.invalidations
+          .map(
+            (i) =>
+              `${nameById(allEntities, i.sourceEntityId)}-${i.relationType}->${nameById(allEntities, i.targetEntityId)}`,
+          )
+          .join(", ");
+  console.log(`${t} facts (${factsResult.facts.length}): ${factsLine}`);
+  console.log(
+    `${t} invalidations (${factsResult.invalidations.length}): ${invLine}`,
   );
 
   const occurredAtIso = episode.occurredAt.toISOString();
@@ -110,13 +168,18 @@ async function processEpisode(job: Job<IngestionJobData>) {
       occurredAtIso,
     ),
   );
-
-  await step(episodeId, "upsert_entity_vectors", () =>
-    upsertEntityVectors(resolved),
+  console.log(
+    `${t} temporal: written=${temporal.written.length} closed=${temporal.closed.length} skipped=${temporal.skipped}`,
   );
 
-  await step(episodeId, "upsert_fact_vectors", () =>
+  const entVecCount = await step(episodeId, "upsert_entity_vectors", () =>
+    upsertEntityVectors(resolved),
+  );
+  const factVecCount = await step(episodeId, "upsert_fact_vectors", () =>
     upsertFactVectors(episode.userId, temporal.written),
+  );
+  console.log(
+    `${t} pinecone: ${entVecCount} entity vector(s), ${factVecCount} fact vector(s) upserted`,
   );
 
   await step(episodeId, "create_episode_node", () =>
@@ -137,11 +200,16 @@ async function processEpisode(job: Job<IngestionJobData>) {
       occurredAtIso,
     ),
   );
+  console.log(
+    `${t} graph: episode node + ${allEntities.length} :MENTIONS edge(s) written`,
+  );
 
   await db
     .update(episodes)
     .set({ status: "processed", processedAt: new Date() })
     .where(eq(episodes.id, episodeId));
+
+  console.log(`${t} done in ${Date.now() - startedAt}ms`);
 }
 
 const worker = new Worker<IngestionJobData>(

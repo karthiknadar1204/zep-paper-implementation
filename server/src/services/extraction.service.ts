@@ -30,29 +30,49 @@ export type EpisodeMessage = {
 
 const ENTITY_EXTRACTION_SYSTEM = `You are an entity extraction system for a long-term memory layer.
 
-From the user's CURRENT message (using the RECENT context only as disambiguation), extract every distinct thing worth remembering — people, organizations, places, products, dates, AND concepts the speaker has an opinion, preference, plan, or relationship to (hobbies, things they like/dislike, projects they are building, ideas they hold).
+From the user's CURRENT message, extract every distinct thing worth remembering — people, organizations, places, products, dates, AND concepts the speaker has an opinion, preference, plan, or relationship to (hobbies, things they like/dislike, projects they are building, ideas they hold).
 
 For each entity output:
-- name: canonical form ("Apple Inc." not "apple", "Dogs" not "dogs")
+- name: canonical form. "Apple Inc." not "apple". "Dogs" not "dogs". Multi-word noun phrases (e.g., "AI memory system", "machine learning model", "neural search engine") are SINGLE entities — do NOT split them into parts. If the current message refers back to something previously discussed using a shortened form ("the project", "it", "the system", "the company"), and the RECENT CONTEXT makes it unambiguous what's being referred to, use the FULL canonical name from the recent context.
 - type: one of PERSON, COMPANY, LOCATION, CONCEPT, PRODUCT, DATE, OTHER
 - summary: one short sentence grounded ONLY in what the messages say
 
 Rules:
+- Extract ONLY entities that are referenced in the CURRENT message. DO NOT extract entities that appear in the recent context but are not referenced in the current message.
 - Do NOT extract the speaker themselves. Their identity is tracked separately by the system.
 - Do NOT invent entities that aren't in the text.
 - Bare common nouns the speaker has a relationship to (likes, dislikes, owns, is building, plans, etc.) ARE entities — extract them as CONCEPT or PRODUCT.
 
 Examples:
 
+Recent context: (none)
 Input: "I love dogs."
 Output: { "entities": [ { "name": "Dogs", "type": "CONCEPT", "summary": "Something the speaker loves." } ] }
 
+Recent context: (none)
 Input: "Yesterday I met Karthik at the Anthropic office."
 Output: { "entities": [
   { "name": "Karthik", "type": "PERSON", "summary": "Someone the speaker met yesterday." },
   { "name": "Anthropic", "type": "COMPANY", "summary": "Company whose office the speaker visited." }
 ] }
 
+Recent context: (none)
+Input: "I'm building an AI memory system at Grok in San Francisco."
+Output: { "entities": [
+  { "name": "AI memory system", "type": "CONCEPT", "summary": "A project the speaker is building." },
+  { "name": "Grok", "type": "COMPANY", "summary": "Where the speaker is building the AI memory system." },
+  { "name": "San Francisco", "type": "LOCATION", "summary": "City where the speaker is based." }
+] }
+
+Recent context:
+user: I'm building an AI memory system at Grok in San Francisco.
+Input: "I'm not building the memory system anymore."
+Output: { "entities": [
+  { "name": "AI memory system", "type": "CONCEPT", "summary": "A project the speaker has stopped working on." }
+] }
+
+Recent context:
+user: I love dogs. I work at Grok.
 Input: "What's the weather?"
 Output: { "entities": [] }
 

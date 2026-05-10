@@ -11090,3 +11090,2389 @@ After ingestion of any episode:
 | Worker step count | 11 step rows in `processing_logs` | Still 11 (Phase C is part of `apply_temporal`) |
 
 When you're ready, we'll do the same walkthrough for retrieval, then run live tests.
+
+---
+
+_**User (2026-05-10 13:20:33Z)**_
+
+now tell me how does the retrieval work? tell me thoroughly
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 13:21:13Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 13:22:42Z)**_
+
+Here's the full retrieval walkthrough — same structure as the ingestion one, traced with a concrete query.
+
+---
+
+## One-line mental model
+
+**Vector search finds the door, the graph walks the room, the temporal filter slams the door on the past.** Pinecone surfaces semantically-relevant nodes; Neo4j expands around them through `:FACT` edges that are currently valid; reranking blends similarity + recency + connectedness into a single score; the result is formatted into an LLM-ready context block.
+
+---
+
+## Single-phase flow (unlike ingestion)
+
+There's no fast-path/slow-path split here. Retrieval is **synchronous** — the user wants context *now*, not eventually. Every step happens in the request thread.
+
+```
+POST /retrieve
+   │
+   ▼
+Hono → requireAuth → Zod → controller → getContext()
+                                │
+                                ▼
+                    ┌── 1. embed(query)              [OpenAI]
+                    │
+                    ▼
+                    ┌── 2. queryVectors()            [Pinecone]
+                    │       ↓ matches → split into
+                    │       entityIds + factIds + score map
+                    ▼
+                    ┌── 3. expandFromIds()           [Neo4j, with TEMPORAL FILTER]
+                    │       ↓ single cypher: walk 1 hop, filter validFrom/validUntil
+                    │       returns ExpandedFact[]
+                    ▼
+                    ┌── 4. rerank: vectorScore + recencyScore + hopScore
+                    │       ↓ sort by totalScore, take top N
+                    ▼
+                    ┌── 5. getRecentMessages()       [Postgres]
+                    │       (only if sessionId provided)
+                    ▼
+                    ┌── 6. formatContext()           [in-memory, string templating]
+                    │
+                    ▼
+                    return { context, facts, recentMessages, asOf }
+```
+
+Total latency: **~300-500ms**, dominated by the OpenAI embedding call.
+
+---
+
+## Concrete trace — `"the user's friend in Japan"`
+
+Let's trace this query against your existing graph (from the test data: Mei, Tokyo, Aria, plus all the unrelated stuff like Kevin/Grok/Karthik).
+
+### Request
+
+```http
+POST /retrieve
+Authorization: Bearer <jwt>
+Content-Type: application/json
+
+{
+  "query": "the user's friend in Japan",
+  "sessionId": "{{sessionId}}",
+  "limit": 6
+}
+```
+
+### Init: middleware + validation
+
+| t | Op | Where |
+|---|---|---|
+| 2ms | `requireAuth` extracts `userId` from JWT; sets it on Hono context | — |
+| 3ms | Zod parses body via `retrieveSchema` (`retrieve.validator.ts`) | — |
+| 5ms | Controller calls `getContext({ userId, query, sessionId, limit })` | — |
+
+### Step 1 — Embed the query
+
+```ts
+embed("the user's friend in Japan") → number[1536]
+```
+
+**OpenAI embeddings call.** Model = `text-embedding-3-small` (must match the dimension your `zep` Pinecone index was created with — 1536).
+
+This is the slowest single step in retrieval — typically 100-200ms.
+
+**Result:** a 1536-dimensional vector representing the query in the same semantic space as your stored entity/fact vectors.
+
+### Step 2 — Pinecone vector search
+
+```ts
+queryVectors(query, userId, topK=25)
+```
+
+Internally:
+```ts
+pineconeIndex.query({
+  vector,                          // from step 1
+  topK: 25,
+  filter: { userId },              // tenancy — non-negotiable
+  includeMetadata: true,
+})
+```
+
+**Pinecone read.** Returns up to 25 `{ id, score, metadata }` matches.
+
+For our query, hits would include:
+```
+score=0.64  type=entity  name="Mei"           (id=mei-uuid)
+score=0.50  type=fact    factText="The user is flying to Tokyo next month."
+score=0.41  type=fact    factText="Mei lives in Tokyo."
+score=0.34  type=fact    factText="The user loves dogs."  ← noise hit
+score=0.33  type=fact    factText="The user loves cats now."  ← noise hit
+... (more low-scoring ones)
+```
+
+Notice: **the Mei entity hits semantically** even though the query never says "Mei." That's the whole point of the vector layer.
+
+We then bucket the matches by `metadata.type`:
+
+```ts
+entityIds = ["mei-uuid", "tokyo-uuid", ...]    // metadata.type === "entity"
+factIds   = ["fact-uuid-1", "fact-uuid-2", ...]  // metadata.type === "fact"
+vectorScoreById = Map { "mei-uuid" → 0.64, "fact-uuid-1" → 0.50, ... }
+```
+
+The `vectorScoreById` map is what the rerank step will use later.
+
+### Step 3 — Neo4j expansion (the temporal-filter step)
+
+```ts
+expandFromIds(userId, { entityIds, factIds, asOf })
+```
+
+This is the most important step. **Single cypher query:**
+
+```cypher
+MATCH (a:Entity { userId: $userId })-[f:FACT]->(b:Entity)
+WHERE (
+  f.factId IN $factIds                  -- direct hits from Pinecone fact-vector matches
+  OR a.entityId IN $entityIds            -- expansion: facts where source matched
+  OR b.entityId IN $entityIds            -- expansion: facts where target matched
+)
+AND f.validFrom <= datetime($asOf)
+AND coalesce(f.validUntil, datetime('9999-01-01')) >= datetime($asOf)
+RETURN
+  f.factId, a.entityId, a.name, a.type,
+  f.relationType,
+  b.entityId, b.name, b.type,
+  f.factText,
+  toString(f.validFrom), toString(f.validUntil),
+  coalesce(f.confidence, 1.0),
+  CASE WHEN f.factId IN $factIds THEN 0 ELSE 1 END AS hop
+```
+
+Three things this query does:
+1. **Direct fact lookups.** Any factId that came back from Pinecone → fetch its full triple from the graph.
+2. **Entity-driven expansion.** Any entityId that came back → walk to *every* `:FACT` edge where this entity is source or target. **This is what brings in Aria.** "the user's friend in Japan" hits the Mei entity vector strongly — graph walks Mei → finds `Mei -[RUNS]-> Aria` even though the query never mentions startups.
+3. **Temporal filter.** `f.validFrom <= asOf AND coalesce(validUntil, 9999) >= asOf` filters out:
+   - Closed edges (e.g., `User -[LOVES]-> Dogs` with `validUntil` set when "I love cats now" came in) when querying current time
+   - Future-dated edges (validFrom > asOf) — only relevant if you load historical data with future timestamps
+
+The `hop` field tags whether each row came in via direct fact-id match (`hop=0`) or entity-driven expansion (`hop=1`). The reranker uses this.
+
+**Returns** `ExpandedFact[]`:
+```ts
+[
+  { factId, sourceId, sourceName: "Mei", relationType: "LIVES_IN", targetName: "Tokyo", factText: "Mei lives in Tokyo.", validFrom, validUntil: null, hop: 0 },
+  { factId, sourceId, sourceName: "Mei", relationType: "RUNS", targetName: "Aria", ..., hop: 1 },
+  { factId, sourceId, sourceName: "User", relationType: "FLYING_TO", targetName: "Tokyo", ..., hop: 0 },
+  { factId, sourceId, sourceName: "User", relationType: "ATTENDING", targetName: "AI agents", ..., hop: 0 },
+  ... possibly more from low-scoring vector hits
+]
+```
+
+Closed edges are **not in this list at all**. The cypher's WHERE filtered them at the database layer.
+
+### Step 4 — Rerank
+
+Now we have a candidate set. Each fact gets four sub-scores combined into one `totalScore`:
+
+```ts
+vectorScore = max(
+  vectorScoreById.get(f.factId) ?? 0,          // direct fact-vector match
+  (vectorScoreById.get(f.sourceId) ?? 0) * 0.7,  // source entity matched, partial credit
+  (vectorScoreById.get(f.targetId) ?? 0) * 0.7,  // target entity matched, partial credit
+)
+
+recencyScore = linear decay:
+  ageDays <= 7   → 1.0
+  ageDays >= 365 → 0.0
+  otherwise: 1 - (ageDays - 7) / 358
+
+hopScore = (f.hop === 0) ? 1.0 : 0.5  // direct hit gets full credit
+
+totalScore = 0.6 * vectorScore  +  0.25 * recencyScore  +  0.15 * hopScore
+```
+
+**Why this blend?** The components capture different signals:
+
+| Signal | Weight | Why |
+|---|---|---|
+| `vectorScore` | 0.6 | Primary — does the fact actually relate to the query? |
+| `recencyScore` | 0.25 | Recent facts are usually more useful than year-old ones for "what's going on" |
+| `hopScore` | 0.15 | A direct vector hit is "more meant" than a 1-hop expansion; expansion is bonus |
+
+These are tunable. The 0.6/0.25/0.15 split is a starting point — adjust if reranking feels off.
+
+After scoring, sort descending by `totalScore`, take `limit` (default 10) entries.
+
+For our query the top-6 should look something like:
+
+```
+[total=0.700 v=0.50 r=1.00 h=0]  User -[FLYING_TO]-> Tokyo
+[total=0.669 v=0.45 r=1.00 h=0]  Mei -[LIVES_IN]-> Tokyo
+[total=0.669 v=0.45 r=1.00 h=0]  Mei -[RUNS]-> Aria         ← graph expansion gold
+[total=0.599 v=0.33 r=1.00 h=0]  User -[LOVES]-> Cats       ← noise from low Pinecone match
+[total=0.566 v=0.28 r=1.00 h=0]  User -[MET_AT]-> Karthik
+[total=0.561 v=0.27 r=1.00 h=0]  User -[ATTENDING]-> AI agents
+```
+
+The Mei + Tokyo + Aria triad is the answer. The bottom three are noise — Pinecone's similarity threshold isn't strict enough to drop them entirely. A future enhancement: add a minimum vector score threshold (e.g. drop everything < 0.3) before rerank.
+
+### Step 5 — Recent messages tail (Postgres)
+
+If `sessionId` was provided (it usually is — agent wants conversation context too):
+
+```ts
+getRecentMessages(sessionId, limit=5)
+```
+
+Internally, **Postgres read:**
+```sql
+SELECT actor, content, occurred_at
+FROM episodes
+WHERE session_id = $1
+ORDER BY occurred_at DESC
+LIMIT 5
+```
+Then `.reverse()` to get oldest-first (better for LLM reading order).
+
+Returns `RecentMessage[]` with `occurredAt` so we can timestamp each line.
+
+### Step 6 — Format the context string
+
+Pure in-memory templating. The output:
+
+```
+Context as of 2026-05-10T12:34:56.789Z.
+
+Relevant facts (currently true):
+- The user is flying to Tokyo next month. (since 2026-05-10)
+- Mei lives in Tokyo. (since 2026-05-10)
+- Mei runs a startup called Aria. (since 2026-05-10)
+- The user loves cats now. (since 2026-05-10)
+- The user met Karthik at the Anthropic office. (since 2026-05-10)
+- The user is attending a conference about AI agents. (since 2026-05-10)
+
+Recent messages in this session:
+> [user @ 2026-05-10 10:18] I love cats now.
+> [user @ 2026-05-10 10:19] Yesterday I met Karthik at the Anthropic office...
+> [user @ 2026-05-10 10:21] What's the weather like?
+> [user @ 2026-05-10 10:21] Next month I'm flying to Tokyo for a conference about AI agents...
+```
+
+This is what an LLM agent would see. It's intentionally readable — the agent can reason over it directly without parsing JSON.
+
+### Step 7 — Return
+
+```json
+{
+  "context": "<the formatted string>",
+  "facts": [
+    { "sourceName": "User", "relationType": "FLYING_TO", "targetName": "Tokyo", "factText": "...", "validFrom": "...", "validUntil": null, "vectorScore": 0.50, "recencyScore": 1.0, "hopScore": 1.0, "totalScore": 0.700, "hop": 0 },
+    ...
+  ],
+  "recentMessages": [...],
+  "asOf": "2026-05-10T12:34:56.789Z"
+}
+```
+
+The `context` field is for an LLM. The `facts` array (with all the score components) is for debugging/UI. `recentMessages` is also for debugging. `asOf` echoes back what was used (so the caller knows whether they got "now" or a historical view).
+
+---
+
+## What each store contributes
+
+| Store | What it does in retrieval | Why we need it |
+|---|---|---|
+| **Pinecone** | Vector search → `topK` candidate node IDs | Without it, you'd need exact entity name matches. "AI safety company" wouldn't find Anthropic. |
+| **Neo4j** | Multi-node lookup + graph expansion + temporal filter | Without it, you'd miss connected facts (`Mei → RUNS → Aria` isn't in the query string), and you'd return closed edges as if they were current. |
+| **Postgres** | Last N messages of the session | Conversation continuity — agent needs "what were we just talking about?" |
+| **OpenAI** | Embed the query | You can't search vectors without making one. |
+
+Pull any one of these out and the system breaks differently:
+- No Pinecone → can't find anything by paraphrase
+- No Neo4j → no connected facts, no time awareness
+- No Postgres → no conversation tail, agent has amnesia between turns
+- No OpenAI → no query vector at all
+
+---
+
+## The temporal filter — the headline feature
+
+This is the line that makes the whole system Zep-shaped:
+
+```cypher
+AND f.validFrom <= datetime($asOf)
+AND coalesce(f.validUntil, datetime('9999-01-01')) >= datetime($asOf)
+```
+
+It runs once per retrieval, in Neo4j, at database speed.
+
+### Default: `asOf = now`
+
+Closed edges (`validUntil IS NOT NULL AND validUntil <= now`) get filtered. The agent sees only what's currently true. `User -[LOVES]-> Dogs` (closed) is invisible; `User -[LOVES]-> Cats` (open) is visible.
+
+### Time travel: `asOf = some-earlier-date`
+
+```json
+POST /retrieve { "query": "what does the user love", "asOf": "2026-05-10T10:18:00Z" }
+```
+
+If the cats edge's `validFrom` is `2026-05-10T10:18:14Z`, then at `10:18:00Z`:
+- The cats edge is **excluded** (validFrom > asOf — fact didn't exist yet)
+- The dogs edge is **included** (validFrom is earlier, validUntil is later or null at that moment)
+
+So: `"what did the user love at 10:18 AM?"` → `Dogs`. The same graph, queried with a different `asOf`, gives a totally different answer.
+
+This is what enables questions like:
+- *"What did the user believe in March?"*
+- *"How have my preferences changed over time?"* (diff two retrievals)
+- *"Replay what the system knew at time T"* (debugging / audit)
+
+We pay zero ingestion-time cost for this property — it falls out of how `validFrom` and `validUntil` are stored on every edge.
+
+---
+
+## What's NOT in retrieval (yet)
+
+A few things from the original plan that I deliberately didn't ship in the first pass:
+
+| Thing | Status | Note |
+|---|---|---|
+| Community summaries | not yet | Communities aren't built. When they are, retrieval would optionally pull `(:Community {userId})-[:CONTAINS]->(e:Entity)` summaries for entities in the result set, prepended to the context. |
+| Multi-hop expansion (2 hops) | currently 1 hop | The cypher only walks one edge from each seed. Two-hop is `[f:FACT*1..2]` — adds Aria's connections to Mei's connections. Higher recall, more noise. Trivial to enable. |
+| LLM reranker on top-K | not yet | Optional final pass that asks the LLM "rerank these N facts by relevance to '<query>'." Adds 500ms but improves quality dramatically. |
+| Result cache in Redis | not yet | Same `(userId, query)` hashing → cache for ~30s. Cheap win for chatty agents. |
+| `includeClosed` flag | not yet | Drops the temporal filter entirely so you can see history without specifying an exact `asOf`. |
+
+---
+
+## API surface (what you can pass)
+
+```ts
+POST /retrieve  (Bearer JWT required)
+{
+  "query": string (1-2000 chars, required),
+  "sessionId"?: uuid,         // include recent-message tail
+  "asOf"?: ISO datetime,      // time travel; default = now
+  "limit"?: int 1-50,         // top facts to return; default 10
+  "vectorTopK"?: int 1-100    // Pinecone net width; default 25
+}
+```
+
+Tweak `vectorTopK` higher when you suspect graph expansion is missing things (more entry points). Tweak `limit` lower for tighter contexts (less to feed the agent).
+
+---
+
+## End-to-end summary
+
+| # | Step | Where | What |
+|---|---|---|---|
+| 1 | embed | OpenAI | query → 1536-dim vector |
+| 2 | vector search | Pinecone | top 25 matches, filtered by userId |
+| 3 | graph expand | Neo4j | walk 1 hop with temporal filter, dedup by factId |
+| 4 | rerank | in-memory | weighted blend of vector + recency + hop |
+| 5 | recent messages | Postgres | last 5 messages of session, oldest-first |
+| 6 | format | in-memory | string templating |
+| 7 | return | — | JSON to caller |
+
+When you're ready, we'll run live tests — including an `asOf`-based time-travel query that should resurface the closed `User -[LOVES]-> Dogs` edge.
+
+---
+
+_**User (2026-05-10 13:26:56Z)**_
+
+hmm ohk now i am doing a comprehensive test on my own so give me 10 queries max covering all kinds of cases to run on postman please
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 13:28:35Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 13:29:18Z)**_
+
+Here are 10 queries — 6 ingest + 4 retrieve — that exercise every meaningful path in the pipeline. Run them in order. Use one fresh session and assume `{{baseUrl}}`, `{{token}}`, `{{sessionId}}` are set in Postman.
+
+I've put **explicit `occurredAt` timestamps** on every ingest so the time-travel retrieval at the end has known bounds.
+
+---
+
+### 1. `POST /sessions` — fresh session
+
+```http
+POST {{baseUrl}}/sessions
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "title": "Comprehensive test" }
+```
+
+**Tests:** session creation + auth.
+**Tests tab (auto-save id):**
+```js
+pm.collectionVariables.set("sessionId", pm.response.json().session.id);
+```
+
+---
+
+### 2. `POST /ingest` — multi-entity + multi-fact + self-fact
+
+```http
+POST {{baseUrl}}/ingest
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "sessionId": "{{sessionId}}",
+  "actor": "user",
+  "content": "I love dogs. I'm building an AI memory system at Grok in San Francisco.",
+  "occurredAt": "2026-05-20T10:00:00Z"
+}
+```
+
+**Tests:** entity extraction across types (PERSON via self-entity, COMPANY=Grok, LOCATION=SF, CONCEPT=AI memory system) + fact extraction including a self-fact (`User -[LOVES]-> Dogs`) and a `BUILDING` self-fact we'll later invalidate.
+
+**Verify (after worker finishes):** `GET /episodes/<episodeId>` shows status `processed` with 11 ok logs.
+
+---
+
+### 3. `POST /ingest` — implicit contradiction (Phase A closure)
+
+```http
+POST {{baseUrl}}/ingest
+...
+{
+  "sessionId": "{{sessionId}}",
+  "actor": "user",
+  "content": "I love cats now, not dogs.",
+  "occurredAt": "2026-05-21T10:00:00Z"
+}
+```
+
+**Tests:** `apply_temporal` Phase A — `User -[LOVES]-> Dogs` should be **closed at `2026-05-21T10:00:00Z`**, new `User -[LOVES]-> Cats` opens.
+
+**Verify (Neo4j):**
+```cypher
+MATCH (u:Entity {name:'User'})-[f:FACT {relationType:'LOVES'}]->(b)
+RETURN b.name, f.validFrom, f.validUntil
+```
+Two rows: Dogs (closed at the test 3 timestamp), Cats (open).
+
+---
+
+### 4. `POST /ingest` — pronoun resolution + multi-fact
+
+```http
+POST {{baseUrl}}/ingest
+...
+{
+  "sessionId": "{{sessionId}}",
+  "actor": "user",
+  "content": "Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on the Codex project.",
+  "occurredAt": "2026-05-21T11:00:00Z"
+}
+```
+
+**Tests:** the "He → Karthik" pronoun fix. Karthik should be the **source** of `USED_TO_WORK_AT OpenAI` and `WORKED_ON Codex`, not OpenAI/Codex.
+
+**Verify (Neo4j):**
+```cypher
+MATCH (a:Entity)-[f:FACT]->(b:Entity)
+WHERE a.name = 'Karthik' OR b.name = 'Karthik'
+RETURN a.name, f.relationType, b.name
+```
+All Karthik-related facts have Karthik as source.
+
+---
+
+### 5. `POST /ingest` — graph-expansion target setup
+
+```http
+POST {{baseUrl}}/ingest
+...
+{
+  "sessionId": "{{sessionId}}",
+  "actor": "user",
+  "content": "My friend Mei lives in Tokyo and runs a startup called Aria.",
+  "occurredAt": "2026-05-21T12:00:00Z"
+}
+```
+
+**Tests:** richer entity batch (PERSON Mei, LOCATION Tokyo, COMPANY Aria) + facts that connect them. This sets up the data for retrieval test 8 (graph expansion).
+
+---
+
+### 6. `POST /ingest` — **pure invalidation (Phase C closure)** ⭐
+
+```http
+POST {{baseUrl}}/ingest
+...
+{
+  "sessionId": "{{sessionId}}",
+  "actor": "user",
+  "content": "I'm not building the memory system anymore.",
+  "occurredAt": "2026-05-22T10:00:00Z"
+}
+```
+
+**Tests:** the new negation path. The LLM should return:
+```json
+{
+  "facts": [],
+  "invalidations": [
+    { "sourceEntityId": "<userId>", "targetEntityId": "<memorySystemId>", "relationType": "BUILDING" }
+  ]
+}
+```
+Phase A skips (no facts). Phase C closes the open `User -[BUILDING]-> AI memory system` edge with `validUntil = 2026-05-22T10:00:00Z`.
+
+**Verify (Neo4j):**
+```cypher
+MATCH (u:Entity {name:'User'})-[f:FACT {relationType:'BUILDING'}]->(b)
+RETURN b.name, f.validFrom, f.validUntil
+```
+Should show **the BUILDING edge with `validUntil` set**, not deleted. If `validUntil` is null, the prompt didn't trigger an invalidation — the model emitted a `STOPPED_BUILDING` fact instead. (Inspect `processing_logs` and the GET /episodes response to debug.)
+
+If this works, the new code path is provably real.
+
+---
+
+### 7. `POST /retrieve` — current state of preferences
+
+```http
+POST {{baseUrl}}/retrieve
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "query": "what does the user love",
+  "sessionId": "{{sessionId}}",
+  "limit": 6
+}
+```
+
+**Tests:** retrieval temporal filter at default `asOf = now`. Top result should be `User -[LOVES]-> Cats`. The closed Dogs edge **should NOT appear at all** in the response — proving the cypher temporal filter excludes it.
+
+**Verify (response JSON):** `facts[].factText` contains "loves cats" but NOT "loves dogs".
+
+---
+
+### 8. `POST /retrieve` — graph expansion
+
+```http
+POST {{baseUrl}}/retrieve
+...
+{
+  "query": "tell me about my friend in Japan",
+  "sessionId": "{{sessionId}}",
+  "limit": 6
+}
+```
+
+**Tests:** the Pinecone+Neo4j hybrid. Pinecone matches Mei semantically (query never says "Mei" or "Aria"). Graph then expands from Mei to find both `Mei -[LIVES_IN]-> Tokyo` AND `Mei -[RUNS]-> Aria`. The Aria fact's appearance is the proof point — Aria has no semantic match to "friend in Japan", it's pulled in by the graph walk.
+
+**Verify (response JSON):** `facts[]` includes both Tokyo and Aria edges. The Aria one likely has lower `vectorScore` but still surfaces.
+
+---
+
+### 9. `POST /retrieve` — pronoun-resolved facts
+
+```http
+POST {{baseUrl}}/retrieve
+...
+{
+  "query": "Karthik's work history",
+  "sessionId": "{{sessionId}}",
+  "limit": 5
+}
+```
+
+**Tests:** that the system can answer about Karthik specifically — proves entity-name vector matching + correct fact attribution. Top results should all have Karthik as source (`USED_TO_WORK_AT OpenAI`, `WORKED_ON Codex`).
+
+**Failure mode to check for:** if any row shows `OpenAI -[WORKED_ON]-> Codex` (with OpenAI as source), the pronoun resolution regressed.
+
+---
+
+### 10. `POST /retrieve` — **time travel** ⭐
+
+```http
+POST {{baseUrl}}/retrieve
+...
+{
+  "query": "what is the user currently building",
+  "sessionId": "{{sessionId}}",
+  "asOf": "2026-05-21T15:00:00Z",
+  "limit": 5
+}
+```
+
+**Tests:** the temporal filter under a non-`now` asOf. The chosen `asOf` is **between test 5 (`2026-05-21T12:00:00Z`) and test 6 (`2026-05-22T10:00:00Z`)** — i.e., the BUILDING edge had been created but not yet invalidated.
+
+**Verify (response JSON):** `User -[BUILDING]-> AI memory system` should appear in `facts[]` with `validUntil` either null OR a value AFTER the asOf. The fact that it surfaces — even though as of "now" it's closed — proves time travel works.
+
+Run the same query without `asOf` (just `"query": "what is the user currently building"`) and confirm the BUILDING edge does NOT appear. The two responses, side by side, are the proof of bi-temporal retrieval.
+
+---
+
+## Summary table
+
+| # | Endpoint | Tests |
+|---|---|---|
+| 1 | `POST /sessions` | session creation + auth |
+| 2 | `POST /ingest` | multi-entity + multi-fact + self-fact |
+| 3 | `POST /ingest` | implicit contradiction (Phase A closure) |
+| 4 | `POST /ingest` | pronoun resolution + compound clauses |
+| 5 | `POST /ingest` | graph-expansion target setup (Mei/Tokyo/Aria) |
+| 6 | `POST /ingest` | **pure invalidation (Phase C closure)** ⭐ |
+| 7 | `POST /retrieve` | current state, temporal filter excludes closed |
+| 8 | `POST /retrieve` | graph expansion (Aria via Mei) |
+| 9 | `POST /retrieve` | pronoun-resolved fact retrieval |
+| 10 | `POST /retrieve` | **time travel via asOf** ⭐ |
+
+Tests 6 and 10 are the new-feature proof points (negation + time travel). The others verify the rest of the pipeline still works around them.
+
+After running all 10, run `bun run verify` for a global state dump to cross-check.
+
+---
+
+_**User (2026-05-10 13:48:30Z)**_
+
+could you add some logging to the worker so i know like entity extraction,resolution invalidation entities and all,basic logging
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 13:49:27Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 13:49:27Z)**_
+
+Adding concise per-step logs to the worker. One-line summaries you can scan during testing.
+
+_**Agent (claude-opus-4-7 2026-05-10 13:49:28Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./server/src/workers/ingestion.worker.ts`
+
+```text
+1	import { Worker, type Job } from "bullmq";
+2	import { eq } from "drizzle-orm";
+3	import { db } from "../models/db";
+4	import { episodes, processingLogs } from "../models/schema";
+5	import {
+6	  INGESTION_QUEUE_NAME,
+7	  type IngestionJobData,
+8	} from "../queues/ingestion.queue";
+9	import { redisConnection } from "../queues/connection";
+10	import {
+11	  fetchEpisodeById,
+12	  getRecentMessages,
+13	} from "../services/episodes.service";
+14	import {
+15	  extractEntities,
+16	  extractFacts,
+17	} from "../services/extraction.service";
+18	import {
+19	  resolveEntities,
+20	  getOrCreateSelfEntity,
+21	} from "../services/resolver.service";
+22	import { applyTemporalFacts } from "../services/temporal.service";
+23	import {
+24	  upsertEntityVectors,
+25	  upsertFactVectors,
+26	} from "../services/pinecone.service";
+27	import {
+28	  createEpisodeNode,
+29	  linkEpisodeToEntities,
+30	} from "../services/neo4j.service";
+31	
+32	async function logStep(
+33	  episodeId: string,
+34	  stepName: string,
+35	  status: "ok" | "error",
+36	  durationMs: number,
+37	  message?: string,
+38	) {
+39	  await db.insert(processingLogs).values({
+40	    episodeId,
+41	    step: stepName,
+42	    status,
+43	    durationMs,
+44	    message: message ?? null,
+45	  });
+46	}
+47	
+48	async function step<T>(
+49	  episodeId: string,
+50	  stepName: string,
+51	  fn: () => Promise<T>,
+52	): Promise<T> {
+53	  const t0 = Date.now();
+54	  try {
+55	    const result = await fn();
+56	    await logStep(episodeId, stepName, "ok", Date.now() - t0);
+57	    return result;
+58	  } catch (err) {
+59	    const msg = err instanceof Error ? err.message : String(err);
+60	    await logStep(episodeId, stepName, "error", Date.now() - t0, msg);
+61	    throw err;
+62	  }
+63	}
+64	
+65	async function processEpisode(job: Job<IngestionJobData>) {
+66	  const { episodeId } = job.data;
+67	
+68	  await db
+69	    .update(episodes)
+70	    .set({ status: "processing" })
+71	    .where(eq(episodes.id, episodeId));
+72	
+73	  const episode = await step(episodeId, "fetch_episode", async () => {
+74	    const ep = await fetchEpisodeById(episodeId);
+75	    if (!ep) throw new Error("episode not found");
+76	    return ep;
+77	  });
+78	
+79	  const recent = await step(episodeId, "fetch_recent", () =>
+80	    getRecentMessages(episode.sessionId, 6, episodeId),
+81	  );
+82	
+83	  const currentMsg = { actor: episode.actor, content: episode.content };
+84	
+85	  const rawEntities = await step(episodeId, "extract_entities", () =>
+86	    extractEntities(currentMsg, recent),
+87	  );
+88	
+89	  const resolved = await step(episodeId, "resolve_entities", () =>
+90	    resolveEntities(episode.userId, rawEntities),
+91	  );
+92	
+93	  const self = await step(episodeId, "get_self_entity", () =>
+94	    getOrCreateSelfEntity(episode.userId),
+95	  );
+96	
+97	  const allEntities = [self, ...resolved];
+98	
+99	  const factsResult = await step(episodeId, "extract_facts", () =>
+100	    extractFacts(currentMsg, recent, allEntities),
+101	  );
+102	
+103	  const occurredAtIso = episode.occurredAt.toISOString();
+104	
+105	  const temporal = await step(episodeId, "apply_temporal", () =>
+106	    applyTemporalFacts(
+107	      factsResult.facts,
+108	      factsResult.invalidations,
+109	      episodeId,
+110	      occurredAtIso,
+111	    ),
+112	  );
+113	
+114	  await step(episodeId, "upsert_entity_vectors", () =>
+115	    upsertEntityVectors(resolved),
+116	  );
+117	
+118	  await step(episodeId, "upsert_fact_vectors", () =>
+119	    upsertFactVectors(episode.userId, temporal.written),
+120	  );
+121	
+122	  await step(episodeId, "create_episode_node", () =>
+123	    createEpisodeNode({
+124	      episodeId,
+125	      userId: episode.userId,
+126	      sessionId: episode.sessionId,
+127	      actor: episode.actor,
+128	      content: episode.content,
+129	      occurredAt: occurredAtIso,
+130	    }),
+131	  );
+132	
+133	  await step(episodeId, "link_episode_entities", () =>
+134	    linkEpisodeToEntities(
+135	      episodeId,
+136	      allEntities.map((e) => e.entityId),
+137	      occurredAtIso,
+138	    ),
+139	  );
+140	
+141	  await db
+142	    .update(episodes)
+143	    .set({ status: "processed", processedAt: new Date() })
+144	    .where(eq(episodes.id, episodeId));
+145	}
+146	
+147	const worker = new Worker<IngestionJobData>(
+148	  INGESTION_QUEUE_NAME,
+149	  processEpisode,
+150	  {
+151	    connection: redisConnection,
+152	    concurrency: 4,
+153	  },
+154	);
+155	
+156	worker.on("completed", (job) => {
+157	  console.log(
+158	    `[worker] completed ${job.id} (episode ${job.data.episodeId})`,
+159	  );
+160	});
+161	
+162	worker.on("failed", async (job, err) => {
+163	  console.error(`[worker] failed ${job?.id}:`, err.message);
+164	  if (!job) return;
+165	
+166	  const isFinalAttempt = job.attemptsMade >= (job.opts.attempts ?? 1);
+167	  if (isFinalAttempt) {
+168	    await db
+169	      .update(episodes)
+170	      .set({ status: "failed" })
+171	      .where(eq(episodes.id, job.data.episodeId));
+172	  }
+173	});
+174	
+175	console.log(`[worker] listening on ${INGESTION_QUEUE_NAME}`);
+176
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 13:49:46Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/workers/ingestion.worker.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 13:50:15Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/workers/ingestion.worker.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 13:50:33Z)**_
+
+Done. The `worker.on("completed")` line still fires after but is now redundant — feel free to remove it if the duplicate "completed" / "done" lines bug you. I left it as-is so BullMQ-level completion is still distinguishable from worker-level completion if you ever care.
+
+Sample output for one ingest of `"I love cats now, not dogs."`:
+
+```
+[ep=386a7e42] start "I love cats now, not dogs."
+[ep=386a7e42] recent: 3 prior message(s) loaded
+[ep=386a7e42] extracted 2 entities: Cats[CONCEPT], Dogs[CONCEPT]
+[ep=386a7e42] resolved 2 (1 new): Cats*, Dogs
+[ep=386a7e42] facts (1): User-LOVES->Cats
+[ep=386a7e42] invalidations (0): (none)
+[ep=386a7e42] temporal: written=1 closed=1 skipped=0
+[ep=386a7e42] pinecone: 1 entity vector(s), 1 fact vector(s) upserted
+[ep=386a7e42] graph: episode node + 3 :MENTIONS edge(s) written
+[ep=386a7e42] done in 2143ms
+[worker] completed 386a7e42-... (episode 386a7e42-...)
+```
+
+What each line tells you:
+- `start` — full content preview, so you know which message is being processed
+- `recent` — how many prior messages were loaded as LLM context
+- `extracted` — what the entity extractor returned (with types, before resolution)
+- `resolved` — `*` marks new entities, no-star are matched to existing graph nodes
+- `facts` / `invalidations` — what the LLM produced; `(none)` for empty, otherwise `Source-RELATION->Target` for each
+- `temporal` — Phase A+B+C aggregated counts: `written` (new edges), `closed` (Phase A contradictions + Phase C invalidations combined), `skipped` (re-affirmations)
+- `pinecone` — how many vectors were embedded+upserted (always 0 for re-affirmations and pure invalidations)
+- `graph` — the episode node + mentions edges
+- `done` — total wall time
+
+Test message 6 from your test plan (`"I'm not building the memory system anymore."`) should produce a line you'll recognize:
+```
+[ep=...] facts (0): (none)
+[ep=...] invalidations (1): User-BUILDING->AI memory system
+[ep=...] temporal: written=0 closed=1 skipped=0
+[ep=...] pinecone: 0 entity vector(s), 0 fact vector(s) upserted
+```
+
+That's the new code path firing. If you see `closed=0` instead, the LLM emitted a `STOPPED_BUILDING` fact (or similar) instead of an invalidation — you'd see that on the `facts` line and know to tighten the prompt.
+
+---
+
+_**User (2026-05-10 14:00:47Z)**_
+
+[worker] listening on memory-ingestion
+[86560f68] start "My friend Mei lives in Tokyo and runs a startup called Aria.."
+[86560f68] recent: 3 prior message(s) loaded
+[86560f68] extracted 3 entities: Mei[PERSON], Tokyo[LOCATION], Aria[COMPANY]
+[86560f68] resolved 3 (3 new): Mei*, Tokyo*, Aria*
+[86560f68] facts (2): Mei-RUNS->Tokyo, Mei-LIVES_IN->Tokyo
+[86560f68] invalidations (0): (none)
+[86560f68] temporal: written=2 closed=0 skipped=0
+[86560f68] pinecone: 3 entity vector(s), 2 fact vector(s) upserted
+[86560f68] graph: episode node + 4 :MENTIONS edge(s) written
+[86560f68] done in 30235ms
+[worker] completed 86560f68-3fc1-4605-be29-3565b678bc21 (episode 86560f68-3fc1-4605-be29-3565b678bc21) see worker] completed 86560f68-3fc1-4605-be29-3565b678bc21 (episode 86560f68-3fc1-4605-be29-3565b678bc21)
+[f3511893] start "I'm not building the memory system anymore.."
+[f3511893] recent: 4 prior message(s) loaded
+[f3511893] extracted 0 entities: (none)
+[f3511893] resolved 0 (0 new): (none)
+[f3511893] facts (0): (none)
+[f3511893] invalidations (0): (none)
+[f3511893] temporal: written=0 closed=0 skipped=0
+[f3511893] pinecone: 0 entity vector(s), 0 fact vector(s) upserted
+[f3511893] graph: episode node + 1 :MENTIONS edge(s) written
+[f3511893] done in 10381ms
+[worker] completed f3511893-f4d2-4c98-b006-5d60acd36320 (episode f3511893-f4d2-4c98-b006-5d60acd36320) could you run the verify script and tell me,see for one user,i see three nodes with the same id on the graph why is that,the entity extraction and the relations also look off,just verify and tell me
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 14:01:12Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:01:13Z)**_
+
+Two real issues to investigate. Let me run the verify script first.
+
+_**Agent (claude-opus-4-7 2026-05-10 14:02:31Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Run pipeline verification across all stores
+
+`cd /Users/karthiknadar/Desktop/zep-paper-implementation/server && bun run verify 2>&1`
+
+```text
+$ bun run scripts/verify-pipeline.ts
+◇ injected env (0) from .env.local // tip: ⌘ enable debugging { debug: true }
+◇ injected env (0) from .env.local // tip: ⌘ override existing { override: true }
+◇ injected env (0) from .env.local // tip: ◈ encrypted .env [www.dotenvx.com]
+◇ injected env (0) from .env.local // tip: ⌘ override existing { override: true }
+Verifying pipeline state for userId=c9a21c02-931a-4948-865d-b1312c2697d0
+
+======================================================================
+POSTGRES
+======================================================================
+
+5 episodes total — by status: {
+  processed: 5,
+}
+
+Details (newest first):
+
+  [PROCESSED] 2026-05-10T13:57:53.960Z
+    "I'm not building the memory system anymore.."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T13:53:08.118Z
+    "My friend Mei lives in Tokyo and runs a startup called Aria.."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T13:51:26.377Z
+    "Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on the Codex pr..."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T13:46:18.097Z
+    "I love cats now, not dogs"
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T13:41:28.303Z
+    "I love dogs. I'm building an AI memory system at Grok in San Francisco."
+    logs: 11 ok, 0 error
+
+======================================================================
+NEO4J
+======================================================================
+
+Entities (12) — by type: {
+  COMPANY: 4,
+  CONCEPT: 2,
+  LOCATION: 2,
+  PERSON: 3,
+  PRODUCT: 1,
+}
+  [COMPANY] Anthropic  (37b9c44a...)
+  [COMPANY] Aria  (e6ca45df...)
+  [COMPANY] Grok  (e9f32e28...)
+  [COMPANY] OpenAI  (9cf33105...)
+  [CONCEPT] Cats  (bd858d9d...)
+  [CONCEPT] Dogs  (9af1a319...)
+  [LOCATION] San Francisco  (0d1eea7d...)
+  [LOCATION] Tokyo  (4af6f727...)
+  [PERSON] Karthik  (bff85e86...)
+  [PERSON] Mei  (e55e9e12...)
+  [PERSON] User  (c9a21c02...)
+  [PRODUCT] Codex  (1d2dd884...)
+
+Facts (9):
+  Grok -[LOCATED_IN]-> San Francisco  (OPEN)
+    "Grok is located in San Francisco."
+  User -[LOVES]-> Dogs  (CLOSED @ 2026-05-10T13:46:18.097000000Z)
+    "The user loves dogs."
+  User -[BUILDING]-> Grok  (OPEN)
+    "The user is building an AI memory system at Grok."
+  User -[LOVES]-> Cats  (OPEN)
+    "The user loves cats."
+  Karthik -[USED_TO_WORK_AT]-> OpenAI  (OPEN)
+    "Karthik used to work at OpenAI."
+  Karthik -[WORKED_ON]-> Codex  (OPEN)
+    "Karthik worked on the Codex project."
+  User -[MET_AT]-> Karthik  (OPEN)
+    "The user met Karthik at the Anthropic office."
+  Mei -[RUNS]-> Tokyo  (OPEN)
+    "Mei runs a startup called Aria."
+  Mei -[LIVES_IN]-> Tokyo  (OPEN)
+    "Mei lives in Tokyo."
+  → 8 open, 1 closed
+
+Episode nodes (5):
+  2026-05-10T13:41:28.303000000Z
+    "I love dogs. I'm building an AI memory system at Grok in San Francisco."
+    mentions: Dogs, Grok, San Francisco, User
+  2026-05-10T13:46:18.097000000Z
+    "I love cats now, not dogs"
+    mentions: Dogs, Grok, San Francisco, User, Cats
+  2026-05-10T13:51:26.377000000Z
+    "Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on th..."
+    mentions: Karthik, Anthropic, OpenAI, Codex, User
+  2026-05-10T13:53:08.118000000Z
+    "My friend Mei lives in Tokyo and runs a startup called Aria.."
+    mentions: Mei, Tokyo, Aria, User
+  2026-05-10T13:57:53.960000000Z
+    "I'm not building the memory system anymore.."
+    mentions: User
+
+======================================================================
+PINECONE
+======================================================================
+
+Query: "where does the user live"
+  [0.366] fact: "Mei lives in Tokyo."
+  [0.365] entity: Tokyo [LOCATION]
+  [0.359] fact: "The user loves dogs."
+  [0.340] fact: "The user loves cats."
+  [0.318] fact: "The user met Karthik at the Anthropic office."
+
+Query: "what does the user love now"
+  [0.512] fact: "The user loves dogs."
+  [0.511] fact: "The user loves cats."
+  [0.510] entity: Cats [CONCEPT]
+  [0.405] entity: Dogs [CONCEPT]
+  [0.298] fact: "The user met Karthik at the Anthropic office."
+
+Query: "AI safety company"
+  [0.449] entity: OpenAI [COMPANY]
+  [0.373] entity: Anthropic [COMPANY]
+  [0.353] entity: Grok [COMPANY]
+  [0.328] fact: "Mei runs a startup called Aria."
+  [0.314] entity: Aria [COMPANY]
+
+Query: "the user's friend in Japan"
+  [0.640] entity: Mei [PERSON]
+  [0.572] entity: Tokyo [LOCATION]
+  [0.413] fact: "Mei lives in Tokyo."
+  [0.356] fact: "The user loves cats."
+  [0.345] fact: "The user loves dogs."
+
+Query: "Karthik's previous employer"
+  [0.693] entity: OpenAI [COMPANY]
+  [0.679] fact: "Karthik used to work at OpenAI."
+  [0.618] fact: "The user met Karthik at the Anthropic office."
+  [0.588] fact: "Karthik worked on the Codex project."
+  [0.539] entity: Karthik [PERSON]
+
+======================================================================
+Done.
+======================================================================
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:03:18Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:03:49Z)**_
+
+Verified. Three real issues, plus the "3 nodes" thing is a visualization artifact.
+
+---
+
+## "3 nodes with same id" — actually only 1
+
+Verify confirms exactly ONE `User` entity in the graph: `(c9a21c02...) [PERSON]`. Run this in Neo4j Browser to prove it to yourself:
+
+```cypher
+MATCH (e:Entity { entityId: 'c9a21c02-931a-4948-865d-b1312c2697d0' })
+RETURN count(e) AS n, collect(e) AS nodes
+```
+Expected `n = 1`.
+
+What you're probably seeing is Neo4j Browser **drawing the same User node multiple times** because it's connected to ~9 different things (4 outgoing `:FACT` edges, 5 incoming `:MENTIONS` edges from each episode). The browser sometimes lays out high-degree nodes by replicating the visual at each path's terminus when you expand the result set. It's one node in the database — same `entityId`, same identity. Neo4j's MERGE constraint guarantees uniqueness on `entityId`.
+
+If you want a cleaner view, run:
+```cypher
+MATCH (u:Entity { entityId: 'c9a21c02-931a-4948-865d-b1312c2697d0' })
+OPTIONAL MATCH (u)-[r]-(m)
+RETURN u, collect(DISTINCT r) AS edges, collect(DISTINCT m) AS neighbors
+```
+That returns one row, one User node, and a flattened set of edges/neighbors.
+
+---
+
+## The real issues — extraction is sloppy on this run
+
+Three bad patterns I can see in the data, in order of severity:
+
+### 1. ❗ `User -[BUILDING]-> Grok` is wrong
+
+Test 1's message: `"I love dogs. I'm building an AI memory system at Grok in San Francisco."`
+
+What landed:
+- `User -[LOVES]-> Dogs` ✅
+- `Grok -[LOCATED_IN]-> San Francisco` ✅
+- `User -[BUILDING]-> Grok` ❌ — should have been `User -[BUILDING]-> "AI memory system"`
+
+**The root cause:** the entity extractor *never extracted "AI memory system" as a CONCEPT entity*. Look at the entity list — no such entity exists. So the fact extractor only had `User`, `Grok`, `San Francisco`, `Dogs` to work with, and the LLM mis-attributed BUILDING's target to Grok ("at Grok" became "is building Grok").
+
+**Why this matters for test 6:** the negation message `"I'm not building the memory system anymore."` couldn't possibly close the BUILDING edge because:
+- The existing edge points to `Grok` (not `"AI memory system"`)
+- Test 6 extracted **0 entities** (didn't even pick up "memory system")
+- Even if it had, the entityId would be different from `Grok`'s — invalidation would scope to `(User, BUILDING, MemorySystem)` and find no match
+
+So test 6 effectively had nothing to close. The closure infrastructure is correct; it just had no target.
+
+### 2. `Mei -[RUNS]-> Tokyo` is wrong
+
+Test 4's message: `"My friend Mei lives in Tokyo and runs a startup called Aria."`
+
+What landed:
+- `Mei -[LIVES_IN]-> Tokyo` ✅
+- `Mei -[RUNS]-> Tokyo` ❌ — should have been `Mei -[RUNS]-> Aria`
+
+This is just the LLM grabbing the wrong target on the second clause. It correctly attributed `RUNS` to Mei (good pronoun handling) but used the previously-mentioned `Tokyo` as the target instead of the new `Aria`. **Aria entity exists** in the graph (verify confirms it), so the entity extractor got it — the fact extractor whiffed on the target binding.
+
+You can also see this is non-deterministic: in earlier runs, the same message produced `Mei -[RUNS]-> Aria` correctly. LLM noise.
+
+### 3. Episode 2's `:MENTIONS` leaks recent-context entities
+
+Test 2's message: `"I love cats now, not dogs"` — talks about cats and dogs only.
+
+What `verify` reports:
+```
+mentions: Dogs, Grok, San Francisco, User, Cats
+```
+
+Why are Grok and San Francisco mentioned? Because the entity extractor *also pulled them out of the recent-context window* (they were in test 1's message, which appeared in the `recent` list passed to `extractEntities`). The prompt says "use recent context only as disambiguation" but the LLM extracted from it anyway.
+
+This is harmless to retrieval (they don't generate new facts), but it bloats `:MENTIONS` with stuff the message didn't actually reference. Long-term it makes "what messages mentioned X?" queries noisy.
+
+---
+
+## What's actually causing this run to look bad
+
+Two prompt issues:
+1. **Entity extractor missed "AI memory system"** as a CONCEPT — which cascaded into wrong fact attribution on test 1 and made test 6's invalidation un-closable.
+2. **Entity extractor leaked from recent context** — adding entities to the current episode that weren't in its text.
+
+Both are tunable via prompt tightening:
+- Add a concrete example that extracts a multi-word noun phrase like `"AI memory system"` as CONCEPT. The current prompt has examples for "Dogs" (single word) but not multi-word concepts the speaker is building/working on.
+- Tighten the recent-context rule: change "use only as disambiguation" to "do NOT extract entities that appear only in the recent context — extract only those mentioned in the current message."
+
+---
+
+## Suggested fixes (in priority order)
+
+1. **Fix the entity-extraction prompt** to (a) explicitly extract multi-word noun phrases the speaker has a relationship to, and (b) NEVER extract from recent context — only the current message.
+2. **Re-run the test 1 message** after the prompt fix to verify "AI memory system" lands as a CONCEPT entity. Then re-run test 6 to verify the BUILDING edge actually closes.
+3. **Don't bother fixing the `Mei -[RUNS]-> Tokyo` bug specifically** — that's LLM noise that varies per call. The prompt has the right examples; the model just slipped.
+
+The headline negation test (test 6) didn't fail because Phase C is broken — it failed because the upstream extraction never gave Phase C anything to act on. Want me to apply the prompt fixes now?
+
+---
+
+_**User (2026-05-10 14:08:57Z)**_
+
+5bbb5cad$
+
+
+
+
+
+MATCH (u:Entity { entityId: 'c9a21c02-931a-4948-865d-b1312c2697d0' }) OPTIONAL MATCH (u)-[r]-(m) RETURN u, collect(DISTINCT r) AS edges, collect(DISTINCT m)
+
+
+
+
+
+Graph
+Table
+RAW
+
+
+
+1
+
+User
+
+[
+FACT
+, 
+FACT
+, 
+FACT
+, 
+FACT
+, 
+MENTIONS
+, 
+MENTIONS
+, 
+MENTIONS
+, 
+MENTIONS
+, 
+MENTIONS
+]
+[
+Karthik
+, 
+Dogs
+, 
+Grok
+, 
+Cats
+, 
+user
+, 
+user
+, 
+user
+, 
+user
+, 
+user
+]
+Node details
+
+
+
+Episode
+Key
+Value
+<id>
+4:d13140ab-b7c9-41d4-a6a7-c721cb2bd68d:15
+
+actor
+"user"
+
+content
+"I love dogs. I'm building an AI memory system at Grok in San Francisco."
+
+createdAt
+2026-05-10T13:42:03.533000000Z
+
+episodeId
+"c88858c5-5fda-4235-9539-114b3e699b51"
+
+occurredAt
+2026-05-10T13:41:28.303000000Z
+
+sessionId
+"14c62e9d-2388-448c-be94-d6d4abfe4de6"
+
+userId
+"c9a21c02-931a-4948-865d-b1312c2697d0" on running   MATCH (u:Entity { entityId: 'c9a21c02-931a-4948-865d-b1312c2697d0' })
+  OPTIONAL MATCH (u)-[r]-(m)
+  RETURN u, collect(DISTINCT r) AS edges, collect(DISTINCT m)
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 14:09:19Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:09:32Z)**_
+
+Found it. **One User entity, 5 Episode nodes that Neo4j Browser labels as `"user"`.**
+
+Look at the Node details panel you pasted — the highlighted node is labeled `Episode`, and one of its properties is `actor: "user"`. That's the trick: Neo4j Browser picks the "most caption-like" string property of each node and displays that as the visual label. For your `:Episode` nodes, the only short string property is `actor`, which is `"user"` for every message you sent. So all 5 Episode nodes render with the caption `"user"`.
+
+Look at the result row:
+```
+edges:    [FACT, FACT, FACT, FACT, MENTIONS, MENTIONS, MENTIONS, MENTIONS, MENTIONS]
+neighbors: [Karthik, Dogs, Grok, Cats, user, user, user, user, user]
+```
+
+That maps cleanly:
+- **4 FACT edges** → 4 distinct entity neighbors (Karthik, Dogs, Grok, Cats)
+- **5 MENTIONS edges** → 5 distinct **Episode** nodes — all labeled `"user"` because of the `actor` property
+
+Total: 1 `User` entity (the row you're looking at) + 9 connected things, of which 5 are episodes that look identical because of the caption confusion.
+
+---
+
+## Two ways to fix the display
+
+**Option 1 (no code change) — change the Browser caption.** In Neo4j Browser, click the `Episode` label chip in the legend at the top of the result panel. A small popup appears with caption options. Pick `<id>` or `episodeId`, or even `content` (will show the message text). Browser remembers this per-session.
+
+**Option 2 (code change) — write a `caption` property when creating the episode.** Add `e.caption = "Episode " + substring($episodeId, 0, 8)` in `createEpisodeNode`'s `ON CREATE SET`. Browser auto-prefers a property literally named `caption`. Tells you at a glance which episode is which.
+
+I'd do option 1 — it's free and you'll never confuse the visualization again.
+
+To prove the database is clean, run:
+
+```cypher
+// How many User entities exist?
+MATCH (e:Entity { name: 'User' }) RETURN count(e) AS userCount, collect(e.entityId) AS ids
+```
+Expected: `userCount: 1`, one id only.
+
+```cypher
+// What labels do those 5 nodes labeled "user" actually have?
+MATCH (u:Entity { entityId: 'c9a21c02-931a-4948-865d-b1312c2697d0' })<-[:MENTIONS]-(n)
+RETURN labels(n) AS lbls, count(*) AS cnt
+```
+Expected: `lbls: ["Episode"], cnt: 5`. They're Episodes, not User-ish things.
+
+The graph is correct. The eyes were lying.
+
+---
+
+_**User (2026-05-10 14:20:11Z)**_
+
+{
+    "query": "what does the user love",
+    "sessionId": "14c62e9d-2388-448c-be94-d6d4abfe4de6",
+    "limit": 6
+    
+}{
+    "context": "Context as of 2026-05-10T14:19:32.485Z.\n\nRelevant facts (currently true):\n- The user loves cats. (since 2026-05-10)\n- The user met Karthik at the Anthropic office. (since 2026-05-10)\n- The user is building an AI memory system at Grok. (since 2026-05-10)\n- Mei runs a startup called Aria. (since 2026-05-10)\n- Karthik used to work at OpenAI. (since 2026-05-10)\n- Mei lives in Tokyo. (since 2026-05-10)\n\nRecent messages in this session:\n> [user @ 2026-05-10 13:41] I love dogs. I'm building an AI memory system at Grok in San Francisco.\n> [user @ 2026-05-10 13:46] I love cats now, not dogs\n> [user @ 2026-05-10 13:51] Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on the Codex project.\n> [user @ 2026-05-10 13:53] My friend Mei lives in Tokyo and runs a startup called Aria..\n> [user @ 2026-05-10 13:57] I'm not building the memory system anymore..",
+    "facts": [
+        {
+            "factId": "e77e3c5e-1fe3-4a97-af43-5407771b2f01",
+            "sourceId": "c9a21c02-931a-4948-865d-b1312c2697d0",
+            "sourceName": "User",
+            "sourceType": "PERSON",
+            "relationType": "LOVES",
+            "targetId": "bd858d9d-6ecc-4da7-8e48-3692d5f4a99f",
+            "targetName": "Cats",
+            "targetType": "CONCEPT",
+            "factText": "The user loves cats.",
+            "validFrom": "2026-05-10T13:46:18.097Z",
+            "validUntil": null,
+            "confidence": 0.99,
+            "hop": 0,
+            "vectorScore": 0.590239584,
+            "recencyScore": 1,
+            "hopScore": 1,
+            "totalScore": 0.7541437504
+        },
+        {
+            "factId": "d274978f-a7af-4fb2-8497-9e926877a8e5",
+            "sourceId": "c9a21c02-931a-4948-865d-b1312c2697d0",
+            "sourceName": "User",
+            "sourceType": "PERSON",
+            "relationType": "MET_AT",
+            "targetId": "bff85e86-d6e9-4923-8249-5e954e8daa9a",
+            "targetName": "Karthik",
+            "targetType": "PERSON",
+            "factText": "The user met Karthik at the Anthropic office.",
+            "validFrom": "2026-05-10T13:51:26.377Z",
+            "validUntil": null,
+            "confidence": 0.95,
+            "hop": 0,
+            "vectorScore": 0.325487852,
+            "recencyScore": 1,
+            "hopScore": 1,
+            "totalScore": 0.5952927112
+        },
+        {
+            "factId": "3f494da8-c262-4034-b1ce-a195ba944044",
+            "sourceId": "c9a21c02-931a-4948-865d-b1312c2697d0",
+            "sourceName": "User",
+            "sourceType": "PERSON",
+            "relationType": "BUILDING",
+            "targetId": "e9f32e28-ccc4-40e8-8959-2009f7eafc3a",
+            "targetName": "Grok",
+            "targetType": "COMPANY",
+            "factText": "The user is building an AI memory system at Grok.",
+            "validFrom": "2026-05-10T13:41:28.303Z",
+            "validUntil": null,
+            "confidence": 0.95,
+            "hop": 0,
+            "vectorScore": 0.302343428,
+            "recencyScore": 1,
+            "hopScore": 1,
+            "totalScore": 0.5814060568
+        },
+        {
+            "factId": "163cbf7f-2c3a-4903-9e6e-1c4ed5801ff6",
+            "sourceId": "e55e9e12-de0f-46e0-aa24-9438cdcc5f3d",
+            "sourceName": "Mei",
+            "sourceType": "PERSON",
+            "relationType": "RUNS",
+            "targetId": "4af6f727-ba11-420a-a2d0-4c7f27602c04",
+            "targetName": "Tokyo",
+            "targetType": "LOCATION",
+            "factText": "Mei runs a startup called Aria.",
+            "validFrom": "2026-05-10T13:53:08.118Z",
+            "validUntil": null,
+            "confidence": 0.99,
+            "hop": 0,
+            "vectorScore": 0.217483848,
+            "recencyScore": 1,
+            "hopScore": 1,
+            "totalScore": 0.5304903088
+        },
+        {
+            "factId": "a3a872ec-3e2a-454b-84ae-38efe3b89b56",
+            "sourceId": "bff85e86-d6e9-4923-8249-5e954e8daa9a",
+            "sourceName": "Karthik",
+            "sourceType": "PERSON",
+            "relationType": "USED_TO_WORK_AT",
+            "targetId": "9cf33105-09c8-4908-b10c-c83ee677d2a0",
+            "targetName": "OpenAI",
+            "targetType": "COMPANY",
+            "factText": "Karthik used to work at OpenAI.",
+            "validFrom": "2026-05-10T13:51:26.377Z",
+            "validUntil": null,
+            "confidence": 0.99,
+            "hop": 0,
+            "vectorScore": 0.189831629,
+            "recencyScore": 1,
+            "hopScore": 1,
+            "totalScore": 0.5138989774
+        },
+        {
+            "factId": "886b16b2-7faa-45e7-827c-f08b9399ac08",
+            "sourceId": "e55e9e12-de0f-46e0-aa24-9438cdcc5f3d",
+            "sourceName": "Mei",
+            "sourceType": "PERSON",
+            "relationType": "LIVES_IN",
+            "targetId": "4af6f727-ba11-420a-a2d0-4c7f27602c04",
+            "targetName": "Tokyo",
+            "targetType": "LOCATION",
+            "factText": "Mei lives in Tokyo.",
+            "validFrom": "2026-05-10T13:53:08.118Z",
+            "validUntil": null,
+            "confidence": 0.99,
+            "hop": 0,
+            "vectorScore": 0.158207551,
+            "recencyScore": 1,
+            "hopScore": 1,
+            "totalScore": 0.49492453059999997
+        }
+    ],
+    "recentMessages": [
+        {
+            "actor": "user",
+            "content": "I love dogs. I'm building an AI memory system at Grok in San Francisco.",
+            "occurredAt": "2026-05-10T13:41:28.303Z"
+        },
+        {
+            "actor": "user",
+            "content": "I love cats now, not dogs",
+            "occurredAt": "2026-05-10T13:46:18.097Z"
+        },
+        {
+            "actor": "user",
+            "content": "Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on the Codex project.",
+            "occurredAt": "2026-05-10T13:51:26.377Z"
+        },
+        {
+            "actor": "user",
+            "content": "My friend Mei lives in Tokyo and runs a startup called Aria..",
+            "occurredAt": "2026-05-10T13:53:08.118Z"
+        },
+        {
+            "actor": "user",
+            "content": "I'm not building the memory system anymore..",
+            "occurredAt": "2026-05-10T13:57:53.960Z"
+        }
+    ],
+    "asOf": "2026-05-10T14:19:32.485Z"
+} huh
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 14:20:47Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:21:16Z)**_
+
+Three things going on. The headline behavior is correct, but you're seeing noise + a real bug from test 6.
+
+---
+
+## ✅ What's working
+
+- **`User -[LOVES]-> Cats` is top result** (0.754) — exact target.
+- **`User -[LOVES]-> Dogs` is NOT in the results** — closed at 13:46, temporal filter excluded it. ✅ Bi-temporal retrieval is real.
+- **Cats has `validFrom: 2026-05-10T13:46:18Z`, `validUntil: null`** — open as expected.
+
+---
+
+## ❗ The BUILDING Grok fact is open — it shouldn't be
+
+Look at fact #3 in your response:
+```
+factId: 3f494da8...
+relationType: BUILDING
+sourceName: User → targetName: Grok
+factText: "The user is building an AI memory system at Grok."
+validFrom: 2026-05-10T13:41:28Z
+validUntil: null    ← still open
+```
+
+But your test 6 message said `"I'm not building the memory system anymore."` — that should have closed it.
+
+**Why it didn't:** look at the worker log for test 6:
+```
+[f3511893] extracted 0 entities: (none)
+[f3511893] facts (0): (none)
+[f3511893] invalidations (0): (none)
+[f3511893] temporal: written=0 closed=0 skipped=0
+```
+
+Entity extraction returned *zero entities* for that message. With no entities, the fact extractor can't emit an invalidation (invalidations require entityIds). With no invalidation, Phase C had nothing to do. The BUILDING edge stayed open.
+
+**Compounding bug from test 1:** even if test 6's extractor *had* picked up "memory system" as an entity, it would have been a **brand-new entity** with a fresh UUID. The existing BUILDING edge points to `Grok` (entityId `e9f32e28...`), not to a "memory system" entity. So the invalidation `(User, BUILDING, MemorySystem)` would scope to a *different* target than the open edge `(User, BUILDING, Grok)` — no match, no closure.
+
+So there are two upstream bugs that prevented closure:
+1. Test 1's prompt mis-attributed BUILDING's target as `Grok` instead of `"AI memory system"` (the latter wasn't even extracted as an entity)
+2. Test 6's prompt didn't extract `"memory system"` as an entity
+
+Both are entity-extraction-prompt issues, not retrieval issues. The retrieval is dutifully reporting what's in the graph; the graph is wrong.
+
+---
+
+## ⚠️ The other 5 facts in the result are noise
+
+Vector scores tell the story:
+```
+Cats LOVES fact:      vectorScore=0.59  ← legit hit
+MET_AT Karthik:       vectorScore=0.32
+BUILDING Grok:        vectorScore=0.30
+Mei RUNS Tokyo:       vectorScore=0.22
+USED_TO_WORK_AT:      vectorScore=0.19
+Mei LIVES_IN Tokyo:   vectorScore=0.16
+```
+
+Why are they here? The query `"what does the user love"` semantically matches the **`User` entity vector** strongly (because "user" is in the query string). Once `User` is in Pinecone's hit list, the graph expansion brings in **every fact where User is source or target** — and rerank gives them all `recencyScore=1.0` (everything happened this week) so their `totalScore` stays high even with weak `vectorScore`.
+
+This is by design: graph expansion is what lets us answer `"the user's friend in Japan"` by walking from Mei → Aria. But for tightly-scoped queries it surfaces too much.
+
+Two simple fixes to consider when you want them:
+
+1. **Add a minimum vector score threshold.** Drop any candidate fact whose `vectorScore < 0.3` before reranking. Cuts most of the noise.
+2. **Penalize "expansion-only" hits more aggressively.** Right now `hopScore = 0.5` for expanded facts. Could drop to `0.2`, or zero them out entirely if their `vectorScore` is below threshold.
+
+I'd start with #1 — one constant, big quality jump on focused queries.
+
+---
+
+## 🤔 The coherence issue
+
+The recent-messages tail in the context includes:
+```
+> [user @ 2026-05-10 13:57] I'm not building the memory system anymore..
+```
+…right next to the open fact `"The user is building an AI memory system at Grok."` This is exactly the situation the negation handling was meant to prevent. The agent reading this context would see contradictory information.
+
+That's the visible cost of test 6 not having extracted any entities. The graph state diverged from what the user actually said.
+
+---
+
+## What I'd do, in order
+
+1. **Fix the entity-extraction prompt** so that "memory system" / "AI memory system" gets extracted as a CONCEPT entity (multi-word noun phrase the speaker has a relationship to). Add a one-shot example covering this case.
+2. **Restrict extraction to current-message-only** (it's leaking from recent context — see test 2's `:MENTIONS` having Grok/SF).
+3. **Reset and re-run the 6 ingest tests** with the fixed prompt. The BUILDING edge should land on a `"AI memory system"` entity. Test 6 should then produce an invalidation that actually closes it.
+4. *(optional)* **Add a 0.3 vector-score floor** in retrieval to clean up the noise.
+
+Want me to ship #1 and #2 now? They're both prompt edits in `extraction.service.ts`.
+
+---
+
+_**User (2026-05-10 14:23:22Z)**_
+
+do all 4 please
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 14:25:00Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:25:02Z)**_
+
+Doing all four. The prompt fix is the bigger surgery; vector-score floor is small.
+
+## Fix 1+2 — Entity extraction prompt
+
+Tightens current-message-only rule, adds multi-word noun phrase example, and handles back-references like `"the memory system"` → canonical `"AI memory system"`.
+
+_**Agent (claude-opus-4-7 2026-05-10 14:25:18Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/extraction.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:25:30Z)**_
+
+The 4th example is the **back-reference case** — `"the memory system"` should resolve to canonical `"AI memory system"` so test 6's invalidation lands on the existing entity. The 5th example proves "current message has no entities" wins even with rich recent context.
+
+## Fix 4 — Vector-score floor in retrieval
+
+Adds `minVectorScore` (default 0.3) — drops weak Pinecone matches before reranking. Caller can override (set to 0 to debug or include weak hits).
+
+_**Agent (claude-opus-4-7 2026-05-10 14:27:13Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:27:37Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:28:13Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:29:16Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:29:21Z)**_
+
+Now expose `minVectorScore` on the API.
+
+_**Agent (claude-opus-4-7 2026-05-10 14:30:04Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/validators/retrieve.validator.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:30:23Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/controllers/retrieve.controller.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:30:51Z)**_
+
+## Fix 3 — Reset state before re-running
+
+You need to nuke the old state for your user (which has wrong data: `BUILDING -> Grok` instead of `BUILDING -> "AI memory system"`). Here's the cleanup, run in order:
+
+**Postgres (SQL — run in your Neon console):**
+```sql
+DELETE FROM episodes WHERE user_id = 'c9a21c02-931a-4948-865d-b1312c2697d0';
+-- processing_logs cascade automatically via the FK
+```
+
+**Neo4j (Cypher — run in your Aura console):**
+```cypher
+MATCH (e:Entity { userId: 'c9a21c02-931a-4948-865d-b1312c2697d0' }) DETACH DELETE e;
+MATCH (ep:Episode { userId: 'c9a21c02-931a-4948-865d-b1312c2697d0' }) DETACH DELETE ep;
+```
+
+**Pinecone:** trickier because v7 serverless restricts metadata-filtered deletes. Easiest path — use the Pinecone console UI:
+1. Go to your `zep` index in console
+2. **Browse Records** tab → filter by `userId = c9a21c02...` → select all → delete
+
+Or in code (programmatic):
+```ts
+// scripts/reset-pinecone.ts (one-off)
+import { pineconeIndex } from "../src/utils/pinecone";
+await pineconeIndex.deleteMany({ filter: { userId: "c9a21c02-931a-4948-865d-b1312c2697d0" } });
+```
+This may or may not work depending on your Pinecone tier — if it errors with "filter delete unsupported", use the console UI route.
+
+> Don't worry too much about leftover Pinecone vectors — the Neo4j temporal filter is what gates retrieval. A stale Pinecone vector for a deleted entity will just never match a Neo4j hop, so it's effectively invisible. They'll cost you a few cents in storage until cleaned up.
+
+After the resets:
+- Restart `bun run dev` and `bun run worker` (worker needs the prompt change loaded)
+- Re-run the 6 ingest tests in order
+
+---
+
+## What success looks like this time
+
+Worker logs you should see for the new behavior:
+
+**Test 1** (`"I love dogs. I'm building an AI memory system at Grok in San Francisco."`):
+```
+[ep=...] extracted 4 entities: Dogs[CONCEPT], AI memory system[CONCEPT], Grok[COMPANY], San Francisco[LOCATION]
+[ep=...] facts (?): User-LOVES->Dogs, User-BUILDING->AI memory system, Grok-LOCATED_IN->San Francisco
+```
+The key: `AI memory system` is its own entity, and `BUILDING` points to it (not to Grok).
+
+**Test 2** (`"I love cats now, not dogs"`):
+```
+[ep=...] extracted 2 entities: Cats[CONCEPT], Dogs[CONCEPT]   ← only 2, NOT 4 (no Grok/SF leakage)
+[ep=...] resolved 2 (1 new): Cats*, Dogs                       ← Dogs matched from test 1
+[ep=...] temporal: written=1 closed=1 skipped=0
+```
+The key: no Grok/San Francisco leak from recent context.
+
+**Test 6** (`"I'm not building the memory system anymore."`):
+```
+[ep=...] extracted 1 entities: AI memory system[CONCEPT]       ← canonical name, not "memory system"
+[ep=...] resolved 1 (0 new): AI memory system                   ← matches existing entity from test 1
+[ep=...] facts (0): (none)
+[ep=...] invalidations (1): User-BUILDING->AI memory system    ← uses the resolved canonical entity
+[ep=...] temporal: written=0 closed=1 skipped=0                 ← Phase C closed the edge!
+```
+That `closed=1` is the proof point for the whole new code path.
+
+Then run `bun run verify` and confirm:
+- `User -[BUILDING]-> AI memory system` shows up with `validUntil` set (closed at test 6's timestamp)
+- No `User -[BUILDING]-> Grok` edge anywhere
+- Episode 2's `:MENTIONS` only includes Cats, Dogs, User (not Grok, SF)
+
+If both land, the negation pipeline is provably end-to-end working.
+
+Run it when ready and paste the worker logs + `verify` output. I'll diagnose any deviations.
+
+---
+
+_**User (2026-05-10 14:38:49Z)**_
+
+➜  server git:(main) ✗ bun run worker
+$ bun run --hot src/workers/ingestion.worker.ts
+◇ injected env (0) from .env.local // tip: ⌘ override existing { override: true }
+◇ injected env (0) from .env.local // tip: ⌘ custom filepath { path: '/custom/path/.env' }
+◇ injected env (0) from .env.local // tip: ⌘ custom filepath { path: '/custom/path/.env' }
+◇ injected env (0) from .env.local // tip: ◈ encrypted .env [www.dotenvx.com]
+◇ injected env (0) from .env.local // tip: ⌘ override existing { override: true }
+[worker] listening on memory-ingestion
+[8b4622c2] start "I love dogs. I'm building an AI memory system at Grok in San Francisco..."
+[8b4622c2] recent: 0 prior message(s) loaded
+[8b4622c2] extracted 4 entities: Dogs[CONCEPT], AI memory system[CONCEPT], Grok[COMPANY], San Francisco[LOCATION]
+[8b4622c2] resolved 4 (4 new): Dogs*, AI memory system*, Grok*, San Francisco*
+[8b4622c2] facts (4): User-LOVES->Dogs, User-BUILDING->AI memory system, User-WORKS_AT->Grok, Grok-LOCATED_IN->San Francisco
+[8b4622c2] invalidations (0): (none)
+[8b4622c2] temporal: written=4 closed=0 skipped=0
+[8b4622c2] pinecone: 4 entity vector(s), 4 fact vector(s) upserted
+[8b4622c2] graph: episode node + 5 :MENTIONS edge(s) written
+[8b4622c2] done in 36986ms
+[worker] completed 8b4622c2-2677-49df-94a2-0c5ba8198e68 (episode 8b4622c2-2677-49df-94a2-0c5ba8198e68)
+[8b6e1e9b] start "I love cats now, not dogs."
+[8b6e1e9b] recent: 1 prior message(s) loaded
+[8b6e1e9b] extracted 2 entities: Cats[CONCEPT], Dogs[CONCEPT]
+[8b6e1e9b] resolved 2 (1 new): Cats*, Dogs
+[8b6e1e9b] facts (1): User-LOVES->Cats
+[8b6e1e9b] invalidations (1): User-LOVES->Dogs
+[8b6e1e9b] temporal: written=1 closed=2 skipped=0
+[8b6e1e9b] pinecone: 1 entity vector(s), 1 fact vector(s) upserted
+[8b6e1e9b] graph: episode node + 3 :MENTIONS edge(s) written
+[8b6e1e9b] done in 21516ms
+[worker] completed 8b6e1e9b-b2ca-43dd-ac8a-975782a1dad1 (episode 8b6e1e9b-b2ca-43dd-ac8a-975782a1dad1)
+[d01b75a8] start " Yesterday I met Karthik at the Anthropic office. He used to work at O..."
+[d01b75a8] recent: 2 prior message(s) loaded
+[d01b75a8] extracted 4 entities: Karthik[PERSON], Anthropic[COMPANY], OpenAI[COMPANY], Codex project[CONCEPT]
+[d01b75a8] resolved 4 (4 new): Karthik*, Anthropic*, OpenAI*, Codex project*
+[d01b75a8] facts (3): User-MET_AT->Karthik, Karthik-USED_TO_WORK_AT->OpenAI, Karthik-WORKED_ON->Codex project
+[d01b75a8] invalidations (0): (none)
+[d01b75a8] temporal: written=3 closed=0 skipped=0
+[d01b75a8] pinecone: 4 entity vector(s), 3 fact vector(s) upserted
+[d01b75a8] graph: episode node + 5 :MENTIONS edge(s) written
+[d01b75a8] done in 25141ms
+[worker] completed d01b75a8-93f7-4b80-add3-a2738eea9d3e (episode d01b75a8-93f7-4b80-add3-a2738eea9d3e)
+[2f2dffa3] start "My friend Mei lives in Tokyo and runs a startup called Aria.."
+[2f2dffa3] recent: 3 prior message(s) loaded
+[2f2dffa3] extracted 3 entities: Mei[PERSON], Tokyo[LOCATION], Aria[COMPANY]
+[2f2dffa3] resolved 3 (3 new): Mei*, Tokyo*, Aria*
+[2f2dffa3] facts (2): Mei-LIVES_IN->Tokyo, Mei-RUNS->Aria
+[2f2: (none)
+[2f2dffa3] temporal: written=2 closed=0 skipped=0
+[2f2dffa3] pinecone: 3 entity vector(s), 2 fact vector(s) upserted
+[2f2dffa3] graph: episode node + 4 :MENTIONS edge(s) written
+[2f2dffa3] done in 21095ms
+[worker] completed 2f2dffa3-88e4-4708-97b9-ccc1f9afdc94 (episode 2f2dffa3-88e4-4708-97b9-ccc1f9afdc94)
+[9f1a320d] start "I'm not building the memory system anymore.."
+[9f1a320d] recent: 4 prior message(s) loaded
+[9f1a320d] extracted 1 entity: AI memory system[CONCEPT]
+[9f1a320d] resolved 1 (0 new): AI memory system
+[9f1a320d] facts (0): (none)
+[9f1a320d] invalidations (1): User-BUILDING->AI memory system
+[9f1a320d] temporal: written=0 closed=1 skipped=0
+[9f1a320d] pinecone: 0 entity vector(s), 0 fact vector(s) upserted
+[9f1a320d] graph: episode node + 2 :MENTIONS edge(s) written
+[9f1a320d] done in 15033ms
+[worker] completed 9f1a320d-a2f1-437c-a587-a940fd4ddf01 (episode 9f1a320d-a2f1-437c-a587-a940fd4ddf01)
+ see verify now please
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 14:39:09Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:39:10Z)**_
+
+This is a clean run. Every fix worked. Let me confirm in the stores.
+
+_**Agent (claude-opus-4-7 2026-05-10 14:39:52Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Verify state across all stores after re-run
+
+`bun run verify 2>&1`
+
+```text
+$ bun run scripts/verify-pipeline.ts
+◇ injected env (0) from .env.local // tip: ⌘ multiple files { path: ['.env.local', '.env'] }
+◇ injected env (0) from .env.local // tip: ◈ encrypted .env [www.dotenvx.com]
+◇ injected env (0) from .env.local // tip: ⌘ suppress logs { quiet: true }
+◇ injected env (0) from .env.local // tip: ⌘ custom filepath { path: '/custom/path/.env' }
+Verifying pipeline state for userId=c9a21c02-931a-4948-865d-b1312c2697d0
+
+======================================================================
+POSTGRES
+======================================================================
+
+5 episodes total — by status: {
+  processed: 5,
+}
+
+Details (newest first):
+
+  [PROCESSED] 2026-05-10T14:37:44.781Z
+    "I'm not building the memory system anymore.."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T14:37:08.394Z
+    "My friend Mei lives in Tokyo and runs a startup called Aria.."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T14:36:32.890Z
+    " Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on the Codex p..."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T14:35:51.314Z
+    "I love cats now, not dogs."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T14:34:47.725Z
+    "I love dogs. I'm building an AI memory system at Grok in San Francisco."
+    logs: 11 ok, 0 error
+
+======================================================================
+NEO4J
+======================================================================
+
+Entities (13) — by type: {
+  COMPANY: 4,
+  CONCEPT: 4,
+  LOCATION: 2,
+  PERSON: 3,
+}
+  [COMPANY] Anthropic  (088c03d6...)
+  [COMPANY] Aria  (6319def1...)
+  [COMPANY] Grok  (5f87d077...)
+  [COMPANY] OpenAI  (c1aa8509...)
+  [CONCEPT] AI memory system  (38281850...)
+  [CONCEPT] Cats  (bd1c550c...)
+  [CONCEPT] Codex project  (88887fec...)
+  [CONCEPT] Dogs  (8d56ea7d...)
+  [LOCATION] San Francisco  (54969c87...)
+  [LOCATION] Tokyo  (d19a868a...)
+  [PERSON] Karthik  (ef187f97...)
+  [PERSON] Mei  (e1970a44...)
+  [PERSON] User  (c9a21c02...)
+
+Facts (10):
+  Grok -[LOCATED_IN]-> San Francisco  (OPEN)
+    "Grok is located in San Francisco."
+  User -[LOVES]-> Dogs  (CLOSED @ 2026-05-10T14:35:51.314000000Z)
+    "The user loves dogs."
+  User -[BUILDING]-> AI memory system  (CLOSED @ 2026-05-10T14:37:44.781000000Z)
+    "The user is building an AI memory system."
+  User -[WORKS_AT]-> Grok  (OPEN)
+    "The user works at Grok."
+  User -[LOVES]-> Cats  (OPEN)
+    "The user loves cats."
+  User -[MET_AT]-> Karthik  (OPEN)
+    "The user met Karthik at the Anthropic office."
+  Karthik -[USED_TO_WORK_AT]-> OpenAI  (OPEN)
+    "Karthik used to work at OpenAI."
+  Karthik -[WORKED_ON]-> Codex project  (OPEN)
+    "Karthik worked on the Codex project."
+  Mei -[LIVES_IN]-> Tokyo  (OPEN)
+    "Mei lives in Tokyo."
+  Mei -[RUNS]-> Aria  (OPEN)
+    "Mei runs a startup called Aria."
+  → 8 open, 2 closed
+
+Episode nodes (5):
+  2026-05-10T14:34:47.725000000Z
+    "I love dogs. I'm building an AI memory system at Grok in San Francisco."
+    mentions: Dogs, AI memory system, Grok, San Francisco, User
+  2026-05-10T14:35:51.314000000Z
+    "I love cats now, not dogs."
+    mentions: Dogs, User, Cats
+  2026-05-10T14:36:32.890000000Z
+    " Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on t..."
+    mentions: User, Karthik, Anthropic, OpenAI, Codex project
+  2026-05-10T14:37:08.394000000Z
+    "My friend Mei lives in Tokyo and runs a startup called Aria.."
+    mentions: User, Mei, Tokyo, Aria
+  2026-05-10T14:37:44.781000000Z
+    "I'm not building the memory system anymore.."
+    mentions: AI memory system, User
+
+======================================================================
+PINECONE
+======================================================================
+
+Query: "where does the user live"
+  [0.470] entity: Mei [PERSON]
+  [0.437] entity: Tokyo [LOCATION]
+  [0.407] fact: "The user works at Grok."
+  [0.366] fact: "Mei lives in Tokyo."
+  [0.359] fact: "The user loves dogs."
+
+Query: "what does the user love now"
+  [0.512] fact: "The user loves dogs."
+  [0.511] fact: "The user loves cats."
+  [0.510] entity: Cats [CONCEPT]
+  [0.405] entity: Dogs [CONCEPT]
+  [0.351] fact: "The user works at Grok."
+
+Query: "AI safety company"
+  [0.449] entity: OpenAI [COMPANY]
+  [0.401] entity: AI memory system [CONCEPT]
+  [0.373] entity: Anthropic [COMPANY]
+  [0.328] fact: "Mei runs a startup called Aria."
+  [0.309] fact: "The user is building an AI memory system."
+
+Query: "the user's friend in Japan"
+  [0.729] entity: Mei [PERSON]
+  [0.606] entity: Tokyo [LOCATION]
+  [0.413] fact: "Mei lives in Tokyo."
+  [0.412] entity: Aria [COMPANY]
+  [0.356] fact: "The user loves cats."
+
+Query: "Karthik's previous employer"
+  [0.693] entity: OpenAI [COMPANY]
+  [0.679] fact: "Karthik used to work at OpenAI."
+  [0.618] fact: "The user met Karthik at the Anthropic office."
+  [0.588] fact: "Karthik worked on the Codex project."
+  [0.539] entity: Karthik [PERSON]
+
+======================================================================
+Done.
+======================================================================
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:40:09Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:40:33Z)**_
+
+Clean across the board. Every fix landed.
+
+---
+
+## Wins to call out
+
+### 1. `AI memory system` is its own entity now ✅
+
+```
+[CONCEPT] AI memory system  (38281850...)
+```
+Test 1's prompt now extracts the multi-word noun phrase as a single CONCEPT entity, not absorbed into "Grok".
+
+### 2. `User -[BUILDING]-> AI memory system` is **CLOSED** at test 5's timestamp ✅
+
+```
+User -[BUILDING]-> AI memory system  (CLOSED @ 2026-05-10T14:37:44.781Z)
+  "The user is building an AI memory system."
+```
+
+This is the headline. The full negation path worked:
+- Test 1 created the BUILDING edge pointing to the right entity
+- Test 5 extracted "AI memory system" as the canonical name (not "memory system")
+- Resolver matched it back to the existing entity (same `normalizedName`)
+- Phase C closed the open edge
+
+### 3. Recent-context leakage is gone ✅
+
+```
+2026-05-10T14:35:51 "I love cats now, not dogs."
+  mentions: Dogs, User, Cats
+```
+
+Compare to the previous run where this episode also mentioned Grok and San Francisco. The current-message-only rule is enforced.
+
+### 4. `Mei -[RUNS]-> Aria` is correct this time ✅
+
+```
+Mei -[RUNS]-> Aria  (OPEN)
+  "Mei runs a startup called Aria."
+```
+Previously it was `RUNS -> Tokyo`. Just LLM noise that the prompt examples (with proper target binding) seem to have stabilized.
+
+### 5. Both contradiction paths fired on "I love cats now, not dogs" ✅
+
+```
+[8b6e1e9b] facts (1): User-LOVES->Cats
+[8b6e1e9b] invalidations (1): User-LOVES->Dogs
+[8b6e1e9b] temporal: written=1 closed=2 skipped=0
+```
+
+The LLM did *both*:
+- Emitted a positive fact `User LOVES Cats` (Phase A closes Dogs because it's not in the new targets)
+- Emitted an explicit invalidation `User LOVES Dogs` (Phase C closes Dogs again, idempotent)
+
+The `closed=2` count is a minor counter-cosmetic issue — it's the same physical edge being closed by both paths, but the counter increments twice. The graph state is correct (one edge, closed once).
+
+### 6. `User -[WORKS_AT]-> Grok` was extracted correctly this time
+
+Bonus from the new prompt: when the user said *"I'm building an AI memory system **at Grok**"*, the model inferred `User WORKS_AT Grok` as a separate fact. That's reasonable inference. Note this fact is **still open** — it didn't get invalidated by test 5 (which was specifically about BUILDING, not WORKS_AT). So if you wanted to test "I left Grok" later, that edge would close cleanly.
+
+---
+
+## Final graph state
+
+| Edge | Status |
+|---|---|
+| `Grok -[LOCATED_IN]-> San Francisco` | OPEN |
+| `User -[WORKS_AT]-> Grok` | OPEN |
+| `User -[LOVES]-> Dogs` | **CLOSED @ test 2 ts** |
+| `User -[BUILDING]-> AI memory system` | **CLOSED @ test 5 ts** |
+| `User -[LOVES]-> Cats` | OPEN |
+| `User -[MET_AT]-> Karthik` | OPEN |
+| `Karthik -[USED_TO_WORK_AT]-> OpenAI` | OPEN |
+| `Karthik -[WORKED_ON]-> Codex project` | OPEN |
+| `Mei -[LIVES_IN]-> Tokyo` | OPEN |
+| `Mei -[RUNS]-> Aria` | OPEN |
+
+**8 open, 2 closed** — exactly the bi-temporal state we'd expect after the 5 test messages.
+
+---
+
+## Pinecone retrieval is also cleaner
+
+`"AI safety company"` → top hits now include `AI memory system [CONCEPT]` (0.401) and the BUILDING fact, because we have a real CONCEPT entity now instead of nothing.
+
+`"the user's friend in Japan"` → Mei (0.729), Tokyo (0.606), Aria (0.412) — exactly the friend-cluster you'd want.
+
+---
+
+## The one remaining cosmetic thing
+
+`closed=2` on test 2's apply_temporal log — both Phase A and Phase C report a closure on the same edge. The graph is correct (one edge, one `validUntil` value), but the counter double-counts. If it bothers you when reading logs, easy fix later: dedup by `factId` before reporting `closed.length`. Not urgent.
+
+---
+
+Now hit `POST /retrieve` again with the same query you used before — you should see far fewer noise hits with the new 0.3 vector floor, and the BUILDING fact should NOT appear (now that it's closed).
+
+---
+
+_**User (2026-05-10 14:40:51Z)**_
+
+dont we have an llm layer for the retrieval as well?
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 14:41:14Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:41:27Z)**_
+
+No — by design, *retrieval has no chat-completion LLM step right now*. The only LLM use is the embedding model (`text-embedding-3-small`) for turning the query into a vector. Everything else is in-memory math + DB queries.
+
+That was a deliberate choice for **latency** — retrieval today is ~300-500ms (one embedding call + two DB hits + sort). A chat-completion step would add 500-2000ms per call.
+
+## Where you could add an LLM layer (in order of bang-for-buck)
+
+**1. LLM reranker** — *highest impact, simplest to add*. After Pinecone+graph produce ~15 candidates, send them to a small chat call: *"Given query X, rank these 15 facts by relevance, return top N as JSON."* Catches semantic relevance the vector layer misses (e.g. negation, intent, "what does X think about Y" that requires reading the fact text). Adds ~700ms and ~$0.0002/query at gpt-4o-mini.
+
+**2. Query rewriting (HyDE)** — *good for vague queries*. Ask the LLM to generate a *hypothetical answer* to the query first, then embed THAT instead of the raw query. The hypothetical answer's vector is usually closer to actual answer-vectors than the query's. Adds ~500ms.
+
+**3. Answer synthesis** — *changes what `/retrieve` returns*. Currently we return context for an agent to read. With a synthesis layer, `/retrieve` would call the LLM with `(query + facts + recent messages)` and return a *direct natural-language answer* instead of structured context. Useful if the consumer ISN'T an agent (e.g. a dashboard).
+
+**4. Multi-query expansion** — *for compound queries*. "What's going on with my work" → expand to `["where do I work", "what am I building", "what are my plans"]`, run each through the pipeline, merge. Adds 2-4× latency but much higher recall on broad questions.
+
+**5. Pre-filter disambiguation** — *for ambiguous queries*. If query is vague, ask user a clarifying question first. Probably not what you want for an autonomous memory system.
+
+## My recommendation
+
+**Build #1 (LLM reranker) first.** It's the standard approach in modern RAG, has well-documented behavior, and the latency is acceptable for an interactive agent. Make it **opt-in via a request flag** (`useLlmRerank: true`) so you can toggle per-query — cheap simple queries skip it, complex ones use it.
+
+If you want, I can build #1 next — slot in cleanly between the existing rerank and final slice.
+
+---
+
+_**User (2026-05-10 14:41:55Z)**_
+
+make it by default,not opt in by request but ya do 1. best
+
+_**User (2026-05-10 14:42:56Z)**_
+
+make it by default,not opt in by request but ya do 1. best
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 14:44:03Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:44:09Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:44:24Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:44:54Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:45:27Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:45:48Z)**_
+
+LLM reranker is in. Always runs, no flag.
+
+What it does:
+1. Takes the top 20 facts from the existing weighted-score sort (already filtered by `minVectorScore` floor of 0.3).
+2. Sends them to `gpt-4o-mini` with the query, asks for relevance scores.
+3. Drops anything the LLM judges irrelevant (score < 0.3 by the prompt's instructions — but the LLM decides what "irrelevant" means semantically).
+4. Returns them ordered by LLM score; `totalScore` is overwritten with the LLM's score.
+5. **Falls back to the original score-based order if the LLM call fails** — so retrieval never hard-fails because of the rerank.
+
+What you'll see in the response now:
+- `facts[].llmScore` — the LLM's relevance score (0-1)
+- `facts[].totalScore` — same as `llmScore` (overrides the weighted blend)
+- `facts[].vectorScore`, `recencyScore`, `hopScore` — still present, useful for debugging
+
+Cost: ~$0.0002 per retrieval at the 20-candidate cap. Latency: +500-1000ms.
+
+---
+
+## What changed in retrieval semantics
+
+The previous reranker used weights `0.6 vector + 0.25 recency + 0.15 hop` — a heuristic. The LLM rerank replaces that with **semantic judgment**: it reads the query and each fact's text, decides which facts actually answer the query, drops the rest.
+
+Concrete impact for your test data — a query like `"what does the user love"` previously returned 6 facts including `MET_AT Karthik`, `BUILDING grok`, etc. (the User-entity-vector match boosted them all). With the LLM rerank, those should get scored ~0.1-0.2 (not relevant to "love") and dropped entirely. You'll likely see just 1-2 results: `LOVES Cats` (high score), maybe `LOVES Dogs` if the LLM decides "what did they love" historically counts.
+
+---
+
+## Test it
+
+Run the same query as before:
+
+```http
+POST /retrieve
+{
+  "query": "what does the user love",
+  "sessionId": "{{sessionId}}",
+  "limit": 6
+}
+```
+
+Expected difference: the response's `facts[]` should be much shorter — likely just `User -[LOVES]-> Cats` (and only that), with `llmScore: 0.95+` and `totalScore` matching. The `MET_AT`, `BUILDING`, `RUNS Aria` facts that were noise should be gone.
+
+Try a multi-faceted query to see the LLM in action:
+```http
+POST /retrieve
+{ "query": "tell me about the user's life — work, friends, hobbies", "sessionId": "{{sessionId}}", "limit": 8 }
+```
+The LLM should rank: WORKS_AT Grok, LOVES Cats, MET_AT Karthik, friend Mei facts — and drop irrelevant stuff.
+
+If you want to **disable** the LLM rerank temporarily for debugging (e.g. to see what the underlying weighted scoring produced), the easiest path is to set `OPENAI_API_KEY=` to an invalid value briefly — the rerank will fail, log a warning, and fall back to the weighted ordering. Cleaner alternative if you find yourself doing this often: I can add a `disableLlmRerank: true` flag to the request schema. Say the word.
+
+---
+
+_**User (2026-05-10 14:46:40Z)**_
+
+{
+    "context": "Context as of 2026-05-10T14:45:56.312Z.\n\nRelevant facts (currently true):\n- The user loves cats. (since 2026-05-10)\n\nRecent messages in this session:\n> [user @ 2026-05-10 14:34] I love dogs. I'm building an AI memory system at Grok in San Francisco.\n> [user @ 2026-05-10 14:35] I love cats now, not dogs.\n> [user @ 2026-05-10 14:36]  Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on the Codex project.\n> [user @ 2026-05-10 14:37] My friend Mei lives in Tokyo and runs a startup called Aria..\n> [user @ 2026-05-10 14:37] I'm not building the memory system anymore..",
+    "facts": [
+        {
+            "factId": "164e9b38-955d-46f2-81d3-733a2567dbd2",
+            "sourceId": "c9a21c02-931a-4948-865d-b1312c2697d0",
+            "sourceName": "User",
+            "sourceType": "PERSON",
+            "relationType": "LOVES",
+            "targetId": "bd1c550c-85fe-4bd3-8774-abb6c085b6ad",
+            "targetName": "Cats",
+            "targetType": "CONCEPT",
+            "factText": "The user loves cats.",
+            "validFrom": "2026-05-10T14:35:51.314Z",
+            "validUntil": null,
+            "confidence": 0.99,
+            "hop": 0,
+            "vectorScore": 0.590239584,
+            "recencyScore": 1,
+            "hopScore": 1,
+            "totalScore": 1,
+            "llmScore": 1
+        }
+    ],
+    "recentMessages": [
+        {
+            "actor": "user",
+            "content": "I love dogs. I'm building an AI memory system at Grok in San Francisco.",
+            "occurredAt": "2026-05-10T14:34:47.725Z"
+        },
+        {
+            "actor": "user",
+            "content": "I love cats now, not dogs.",
+            "occurredAt": "2026-05-10T14:35:51.314Z"
+        },
+        {
+            "actor": "user",
+            "content": " Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on the Codex project.",
+            "occurredAt": "2026-05-10T14:36:32.890Z"
+        },
+        {
+            "actor": "user",
+            "content": "My friend Mei lives in Tokyo and runs a startup called Aria..",
+            "occurredAt": "2026-05-10T14:37:08.394Z"
+        },
+        {
+            "actor": "user",
+            "content": "I'm not building the memory system anymore..",
+            "occurredAt": "2026-05-10T14:37:44.781Z"
+        }
+    ],
+    "asOf": "2026-05-10T14:45:56.312Z"
+} where is the output mn the summary one,i was expecting that man
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 14:47:09Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:47:11Z)**_
+
+Ah — that was **option #3 from earlier (answer synthesis)**, separate from the reranker we built (option #1). The reranker picks/orders relevant facts; what you wanted is an LLM that *reads the facts and writes a natural-language answer*. Adding it now.
+
+_**Agent (claude-opus-4-7 2026-05-10 14:47:24Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:47:39Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:47:48Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 14:48:03Z)**_
+
+Done. The retrieval response now leads with `answer` — a 1–3 sentence natural-language synthesis written from the reranked facts + recent message tail, grounded only in what was retrieved.
+
+Re-run your same query:
+
+```http
+POST /retrieve
+{ "query": "what does the user love", "sessionId": "{{sessionId}}", "limit": 6 }
+```
+
+Expected response:
+```json
+{
+  "answer": "The user loves cats. They previously loved dogs but no longer do.",
+  "context": "Context as of ...\n\nRelevant facts (currently true):\n- The user loves cats. ...",
+  "facts": [
+    { "factId": "...", "factText": "The user loves cats.", ... }
+  ],
+  "recentMessages": [...],
+  "asOf": "..."
+}
+```
+
+The full pipeline is now:
+
+```
+POST /retrieve query
+   │
+   ├─ embed query                   [OpenAI embeddings, ~150ms]
+   ├─ vector search                 [Pinecone, ~100ms]
+   ├─ graph expand + temporal       [Neo4j, ~50ms]
+   ├─ score-based filter+sort       [in-memory]
+   ├─ LLM rerank (drops noise)      [gpt-4o-mini, ~700ms]
+   ├─ LLM answer synthesis          [gpt-4o-mini, ~700ms]   ← new
+   ├─ recent messages tail          [Postgres, ~30ms]
+   └─ format context block          [in-memory]
+```
+
+Total: roughly 1.5–2s. Cost: ~$0.0004/query (rerank + answer combined). Both LLM calls fall back gracefully — if either fails, retrieval still returns useful data (the score-based ordering, and `(unable to generate answer)` for the synthesis).
+
+Try a closed-fact query like `"what did the user used to love"` — the answer should reference the closed Dogs edge ("The user used to love dogs..."). And `"what is the user building"` should return `"I don't have information about that yet."` or similar, because the BUILDING edge is closed.

@@ -21,6 +21,7 @@ export async function retrieve(c: Context<{ Variables: AuthVariables }>) {
     asOf: parsed.data.asOf,
     limit: parsed.data.limit,
     vectorTopK: parsed.data.vectorTopK,
+    minVectorScore: parsed.data.minVectorScore,
   });
 
   return c.json(result);
