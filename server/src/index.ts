@@ -1,9 +1,28 @@
-import { Hono } from 'hono'
+import { Hono } from "hono";
+import { logger } from "hono/logger";
+import { cors } from "hono/cors";
+import { authRouter } from "./routes/auth.routes";
+import {
+  requireAuth,
+  type AuthVariables,
+} from "./middleware/auth.middleware";
 
-const app = new Hono()
-app.get('/', (c) => c.text('Hello Bun!'))
+const app = new Hono<{ Variables: AuthVariables }>();
 
-export default { 
-  port: 3002, 
-  fetch: app.fetch, 
-} 
+app.use("*", logger());
+app.use("*", cors());
+
+app.get("/", (c) => c.text("Zep memory server"));
+
+app.route("/auth", authRouter);
+
+const protectedRoutes = new Hono<{ Variables: AuthVariables }>();
+protectedRoutes.use("*", requireAuth);
+protectedRoutes.get("/me", (c) => c.json({ userId: c.get("userId") }));
+
+app.route("/", protectedRoutes);
+
+export default {
+  port: 3002,
+  fetch: app.fetch,
+};
