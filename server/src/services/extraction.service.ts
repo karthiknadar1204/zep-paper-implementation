@@ -103,26 +103,47 @@ export const RawFactSchema = z.object({
   confidence: z.number().min(0).max(1),
 });
 
-const FactListSchema = z.object({
+export const RawInvalidationSchema = z.object({
+  sourceEntityId: z.string().min(1),
+  targetEntityId: z.string().min(1),
+  relationType: z.string().regex(/^[A-Z][A-Z0-9_]*$/),
+});
+
+const FactsResponseSchema = z.object({
   facts: z.array(RawFactSchema),
+  invalidations: z.array(RawInvalidationSchema),
 });
 
 export type RawFact = z.infer<typeof RawFactSchema>;
+export type RawInvalidation = z.infer<typeof RawInvalidationSchema>;
+export type FactsExtractionResult = {
+  facts: RawFact[];
+  invalidations: RawInvalidation[];
+};
 
-const FACT_EXTRACTION_SYSTEM = `You are a fact extraction system for a knowledge graph.
+const FACT_EXTRACTION_SYSTEM = `You are a fact extraction system for a temporal knowledge graph.
 
-Given a message and a list of entities, extract relationships BETWEEN those entities. Each fact is a triple: source → relation → target.
+Given a message and a list of entities, extract TWO things:
+1. NEW relationships between those entities ("facts").
+2. EXISTING relationships that this message says are now ENDED ("invalidations").
+
+Each fact is a triple: source → relation → target.
+Each invalidation identifies a previously-true triple that should now be considered no longer current.
 
 Rules:
 - Use ONLY the entity IDs from the list below. Do NOT invent entities.
-- Both source and target must be in the list.
-- The list may include a "User" entity — that represents the speaker. Use it as source for facts about the speaker themselves (preferences, opinions, plans, where they live, who they know).
+- Both source and target of every fact AND every invalidation must be in the list.
+- The list may include a "User" entity — that represents the speaker. Use it as source for facts/invalidations about the speaker themselves.
 - relationType: a short verb phrase in UPPER_SNAKE_CASE (e.g., WORKS_AT, LIVES_IN, FOUNDED, KNOWS, MET_AT, USED_TO_WORK_AT, LIKES, LOVES, WORKED_ON, BUILDING).
 - factText: ONE short atomic sentence describing ONLY this triple. Do NOT verbatim-copy the source message — extract just the relationship and write it as a clean standalone fact.
 - confidence: 0.0 to 1.0 — how strongly the message supports this fact.
 - Resolve pronouns to their subject. "He used to work..." refers to the previously mentioned PERSON; use that PERSON's entityId as the source, NOT a different entity.
-- Skip facts that aren't explicitly stated or strongly implied.
 - Skip self-loops (source equals target).
+
+NEGATION HANDLING (very important):
+- Do NOT extract negation/cessation as a positive fact. Phrases like "I left X", "I quit X", "I no longer like Y", "X stopped working at Z" must NOT produce facts like LEFT_COMPANY, NO_LONGER_LIKES, STOPPED_WORKING_AT.
+- Instead, emit an entry in \`invalidations\` naming the previously-true relation that has now ended. Use the canonical positive predicate (e.g., WORKS_AT, LIKES) — NOT a negation.
+- If the message states both an ending AND a new state ("I left Grok and joined Anthropic"), emit a new fact for the new state AND an invalidation for the old one.
 
 Examples:
 
@@ -130,7 +151,7 @@ Entities:
   e1 → "Kevin" [PERSON]
   e2 → "Grok" [COMPANY]
 Message: "Kevin works at Grok."
-Output: { "facts": [ { "sourceEntityId": "e1", "targetEntityId": "e2", "relationType": "WORKS_AT", "factText": "Kevin works at Grok.", "confidence": 0.99 } ] }
+Output: { "facts": [ { "sourceEntityId": "e1", "targetEntityId": "e2", "relationType": "WORKS_AT", "factText": "Kevin works at Grok.", "confidence": 0.99 } ], "invalidations": [] }
 
 Entities:
   e1 → "Karthik" [PERSON]
@@ -140,7 +161,7 @@ Message: "Karthik used to work at OpenAI on the Codex project."
 Output: { "facts": [
   { "sourceEntityId": "e1", "targetEntityId": "e2", "relationType": "USED_TO_WORK_AT", "factText": "Karthik used to work at OpenAI.", "confidence": 0.99 },
   { "sourceEntityId": "e1", "targetEntityId": "e3", "relationType": "WORKED_ON", "factText": "Karthik worked on the Codex project.", "confidence": 0.95 }
-] }
+], "invalidations": [] }
 
 Entities:
   u1 → "User" [PERSON]
@@ -148,22 +169,45 @@ Entities:
 Message: "I love dogs."
 Output: { "facts": [
   { "sourceEntityId": "u1", "targetEntityId": "e1", "relationType": "LOVES", "factText": "The user loves dogs.", "confidence": 0.99 }
+], "invalidations": [] }
+
+Entities:
+  u1 → "User" [PERSON]
+  e1 → "Grok" [COMPANY]
+Message: "I left Grok last month."
+Output: { "facts": [], "invalidations": [
+  { "sourceEntityId": "u1", "targetEntityId": "e1", "relationType": "WORKS_AT" }
+] }
+
+Entities:
+  u1 → "User" [PERSON]
+  e1 → "Grok" [COMPANY]
+  e2 → "Anthropic" [COMPANY]
+Message: "I left Grok and joined Anthropic."
+Output: { "facts": [
+  { "sourceEntityId": "u1", "targetEntityId": "e2", "relationType": "WORKS_AT", "factText": "The user works at Anthropic.", "confidence": 0.99 }
+], "invalidations": [
+  { "sourceEntityId": "u1", "targetEntityId": "e1", "relationType": "WORKS_AT" }
 ] }
 
 Entities:
   e1 → "Karthik" [PERSON]
   e2 → "Anthropic" [COMPANY]
 Message: "What's the weather?"
-Output: { "facts": [] }
+Output: { "facts": [], "invalidations": [] }
 
-Return JSON exactly: { "facts": [ { "sourceEntityId": string, "targetEntityId": string, "relationType": string, "factText": string, "confidence": number } ] }`;
+Return JSON exactly: {
+  "facts": [ { "sourceEntityId": string, "targetEntityId": string, "relationType": string, "factText": string, "confidence": number } ],
+  "invalidations": [ { "sourceEntityId": string, "targetEntityId": string, "relationType": string } ]
+}`;
 
 export async function extractFacts(
   current: EpisodeMessage,
   recent: EpisodeMessage[],
   entities: FactExtractionEntity[],
-): Promise<RawFact[]> {
-  if (entities.length < 2) return [];
+): Promise<FactsExtractionResult> {
+  const empty: FactsExtractionResult = { facts: [], invalidations: [] };
+  if (entities.length < 2) return empty;
 
   const entityList = entities
     .map((e) => `  ${e.entityId} → "${e.name}" [${e.type}]`)
@@ -192,16 +236,26 @@ ${current.actor}: ${current.content}`;
   });
 
   const raw = completion.choices[0]?.message?.content;
-  if (!raw) return [];
+  if (!raw) return empty;
 
   const json = JSON.parse(raw);
-  const validated = FactListSchema.parse(json);
+  const validated = FactsResponseSchema.parse(json);
 
   const validIds = new Set(entities.map((e) => e.entityId));
-  return validated.facts.filter(
+
+  const facts = validated.facts.filter(
     (f) =>
       validIds.has(f.sourceEntityId) &&
       validIds.has(f.targetEntityId) &&
       f.sourceEntityId !== f.targetEntityId,
   );
+
+  const invalidations = validated.invalidations.filter(
+    (i) =>
+      validIds.has(i.sourceEntityId) &&
+      validIds.has(i.targetEntityId) &&
+      i.sourceEntityId !== i.targetEntityId,
+  );
+
+  return { facts, invalidations };
 }

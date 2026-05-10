@@ -33,20 +33,29 @@ async function main() {
       );
     }
 
-    const facts = await extractFacts(
+    const result = await extractFacts(
       { actor: "user", content },
       [],
       allEntities,
     );
 
-    console.log(`\nFacts (${facts.length}):`);
-    for (const f of facts) {
+    console.log(`\nFacts (${result.facts.length}):`);
+    for (const f of result.facts) {
       const src = allEntities.find((e) => e.entityId === f.sourceEntityId);
       const tgt = allEntities.find((e) => e.entityId === f.targetEntityId);
       console.log(
         `  ${src?.name ?? "?"} -[${f.relationType}]-> ${tgt?.name ?? "?"}  (conf ${f.confidence})`,
       );
       console.log(`    "${f.factText}"`);
+    }
+
+    console.log(`\nInvalidations (${result.invalidations.length}):`);
+    for (const i of result.invalidations) {
+      const src = allEntities.find((e) => e.entityId === i.sourceEntityId);
+      const tgt = allEntities.find((e) => e.entityId === i.targetEntityId);
+      console.log(
+        `  CLOSE  ${src?.name ?? "?"} -[${i.relationType}]-> ${tgt?.name ?? "?"}`,
+      );
     }
     console.log();
   }

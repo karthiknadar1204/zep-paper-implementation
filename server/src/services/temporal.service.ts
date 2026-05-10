@@ -5,7 +5,7 @@ import {
   upsertFact,
   type GraphFact,
 } from "./neo4j.service";
-import type { RawFact } from "./extraction.service";
+import type { RawFact, RawInvalidation } from "./extraction.service";
 
 export type TemporalFact = GraphFact & { isNew: boolean };
 
@@ -23,10 +23,11 @@ export type TemporalResult = {
 
 export async function applyTemporalFacts(
   rawFacts: RawFact[],
+  invalidations: RawInvalidation[],
   episodeId: string,
   occurredAt: string,
 ): Promise<TemporalResult> {
-  if (rawFacts.length === 0) {
+  if (rawFacts.length === 0 && invalidations.length === 0) {
     return { written: [], closed: [], skipped: 0 };
   }
 
@@ -112,5 +113,49 @@ export async function applyTemporalFacts(
   }
   await Promise.all(writes);
 
-  return { written, closed, skipped };
+  // Explicit invalidations: close any open edge matching (source, relationType, target).
+  // Idempotent: edges already closed by contradiction logic above are simply re-stamped
+  // with the same `validUntil` (no-op).
+  const invalidationGroups = new Map<
+    string,
+    Array<{ factId: string; targetEntityId: string }>
+  >();
+  await Promise.all(
+    invalidations.map(async (inv) => {
+      const key = groupKey(inv.sourceEntityId, inv.relationType);
+      if (invalidationGroups.has(key)) return;
+      const opens =
+        existingByGroup.get(key) ??
+        (await findOpenFactsForSourceAndRelation(
+          inv.sourceEntityId,
+          inv.relationType,
+        ));
+      invalidationGroups.set(key, opens);
+    }),
+  );
+
+  const invalidationCloses: ClosedEdge[] = [];
+  await Promise.all(
+    invalidations.map(async (inv) => {
+      const key = groupKey(inv.sourceEntityId, inv.relationType);
+      const opens = invalidationGroups.get(key) ?? [];
+      const matching = opens.filter(
+        (e) => e.targetEntityId === inv.targetEntityId,
+      );
+      for (const m of matching) {
+        await closeFact(m.factId, occurredAt);
+        invalidationCloses.push({
+          factId: m.factId,
+          targetEntityId: m.targetEntityId,
+          closedAt: occurredAt,
+        });
+      }
+    }),
+  );
+
+  return {
+    written,
+    closed: [...closed, ...invalidationCloses],
+    skipped,
+  };
 }

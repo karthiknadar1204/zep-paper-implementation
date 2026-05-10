@@ -1,4 +1,4 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, ne } from "drizzle-orm";
 import { db } from "../models/db";
 import { sessions, episodes, processingLogs } from "../models/schema";
 import { enqueueEpisodeProcessing } from "../queues/ingestion.queue";
@@ -78,4 +78,44 @@ export async function getEpisodeWithLogs(
     .orderBy(asc(processingLogs.createdAt));
 
   return { episode, logs };
+}
+
+export async function fetchEpisodeById(
+  episodeId: string,
+): Promise<EpisodeRow | null> {
+  const [row] = await db
+    .select()
+    .from(episodes)
+    .where(eq(episodes.id, episodeId))
+    .limit(1);
+  return row ?? null;
+}
+
+export type RecentMessage = {
+  actor: "user" | "assistant" | "system";
+  content: string;
+  occurredAt: Date;
+};
+
+export async function getRecentMessages(
+  sessionId: string,
+  limit: number,
+  excludeEpisodeId?: string,
+): Promise<RecentMessage[]> {
+  const where = excludeEpisodeId
+    ? and(eq(episodes.sessionId, sessionId), ne(episodes.id, excludeEpisodeId))
+    : eq(episodes.sessionId, sessionId);
+
+  const rows = await db
+    .select({
+      actor: episodes.actor,
+      content: episodes.content,
+      occurredAt: episodes.occurredAt,
+    })
+    .from(episodes)
+    .where(where)
+    .orderBy(desc(episodes.occurredAt))
+    .limit(limit);
+
+  return rows.reverse();
 }

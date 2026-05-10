@@ -212,6 +212,70 @@ export async function closeFact(
   );
 }
 
+export type ExpandedFact = {
+  factId: string;
+  sourceId: string;
+  sourceName: string;
+  sourceType: string;
+  relationType: string;
+  targetId: string;
+  targetName: string;
+  targetType: string;
+  factText: string;
+  validFrom: string;
+  validUntil: string | null;
+  confidence: number;
+  hop: number;
+};
+
+export async function expandFromIds(
+  userId: string,
+  input: { entityIds: string[]; factIds: string[]; asOf: string },
+): Promise<ExpandedFact[]> {
+  const { entityIds, factIds, asOf } = input;
+  if (entityIds.length === 0 && factIds.length === 0) return [];
+
+  const records = await runQuery(
+    `
+    MATCH (a:Entity { userId: $userId })-[f:FACT]->(b:Entity)
+    WHERE (
+      f.factId IN $factIds
+      OR a.entityId IN $entityIds
+      OR b.entityId IN $entityIds
+    )
+    AND f.validFrom <= datetime($asOf)
+    AND coalesce(f.validUntil, datetime('9999-01-01')) >= datetime($asOf)
+    RETURN
+      f.factId AS factId,
+      a.entityId AS sourceId, a.name AS sourceName, a.type AS sourceType,
+      f.relationType AS relationType,
+      b.entityId AS targetId, b.name AS targetName, b.type AS targetType,
+      f.factText AS factText,
+      toString(f.validFrom) AS validFrom,
+      toString(f.validUntil) AS validUntil,
+      coalesce(f.confidence, 1.0) AS confidence,
+      CASE WHEN f.factId IN $factIds THEN 0 ELSE 1 END AS hop
+    `,
+    { userId, factIds, entityIds, asOf },
+  );
+
+  return records.map((r) => ({
+    factId: r.get("factId") as string,
+    sourceId: r.get("sourceId") as string,
+    sourceName: r.get("sourceName") as string,
+    sourceType: r.get("sourceType") as string,
+    relationType: r.get("relationType") as string,
+    targetId: r.get("targetId") as string,
+    targetName: r.get("targetName") as string,
+    targetType: r.get("targetType") as string,
+    factText: r.get("factText") as string,
+    validFrom: r.get("validFrom") as string,
+    validUntil: (r.get("validUntil") as string | null) ?? null,
+    confidence: Number(r.get("confidence")),
+    hop: Number(r.get("hop")),
+  }));
+}
+
 export async function upsertFact(fact: GraphFact): Promise<void> {
   await runQuery(
     `

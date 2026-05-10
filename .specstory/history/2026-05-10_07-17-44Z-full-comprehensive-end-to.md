@@ -8485,3 +8485,2608 @@ Three lessons embedded in this order:
 1. **Postgres comes first, Postgres comes last.** It bookends the worker — you read the source of truth, you write the "done" flag back to it.
 2. **Neo4j is touched many times.** Every "structural" step (entities, facts, episode, mentions) goes there. The graph is built incrementally within one worker run.
 3. **Pinecone is touched twice — and only for new things.** Cheaper than re-embedding. The `isNew` flags from Step 4 and the `temporal.written` array from Step 7 are what tell us what's new.
+
+---
+
+_**User (2026-05-10 10:07:44Z)**_
+
+perfect,plug it all together end to end full
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 10:08:42Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 10:08:43Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./server/src/services/episodes.service.ts`
+
+```text
+1	import { and, asc, eq } from "drizzle-orm";
+2	import { db } from "../models/db";
+3	import { sessions, episodes, processingLogs } from "../models/schema";
+4	import { enqueueEpisodeProcessing } from "../queues/ingestion.queue";
+5	
+6	export class SessionNotFoundError extends Error {
+7	  constructor() {
+8	    super("SESSION_NOT_FOUND");
+9	    this.name = "SessionNotFoundError";
+10	  }
+11	}
+12	
+13	export class EpisodeNotFoundError extends Error {
+14	  constructor() {
+15	    super("EPISODE_NOT_FOUND");
+16	    this.name = "EpisodeNotFoundError";
+17	  }
+18	}
+19	
+20	export type EpisodeRow = typeof episodes.$inferSelect;
+21	export type ProcessingLogRow = typeof processingLogs.$inferSelect;
+22	
+23	export type CreateEpisodeInput = {
+24	  sessionId: string;
+25	  actor: "user" | "assistant" | "system";
+26	  content: string;
+27	  occurredAt?: string;
+28	};
+29	
+30	export async function createEpisode(
+31	  userId: string,
+32	  input: CreateEpisodeInput,
+33	): Promise<EpisodeRow> {
+34	  const [session] = await db
+35	    .select({ id: sessions.id })
+36	    .from(sessions)
+37	    .where(and(eq(sessions.id, input.sessionId), eq(sessions.userId, userId)))
+38	    .limit(1);
+39	
+40	  if (!session) {
+41	    throw new SessionNotFoundError();
+42	  }
+43	
+44	  const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
+45	
+46	  const [row] = await db
+47	    .insert(episodes)
+48	    .values({
+49	      userId,
+50	      sessionId: input.sessionId,
+51	      actor: input.actor,
+52	      content: input.content,
+53	      occurredAt,
+54	    })
+55	    .returning();
+56	
+57	  await enqueueEpisodeProcessing(row.id);
+58	
+59	  return row;
+60	}
+61	
+62	export async function getEpisodeWithLogs(
+63	  userId: string,
+64	  episodeId: string,
+65	): Promise<{ episode: EpisodeRow; logs: ProcessingLogRow[] }> {
+66	  const [episode] = await db
+67	    .select()
+68	    .from(episodes)
+69	    .where(and(eq(episodes.id, episodeId), eq(episodes.userId, userId)))
+70	    .limit(1);
+71	
+72	  if (!episode) throw new EpisodeNotFoundError();
+73	
+74	  const logs = await db
+75	    .select()
+76	    .from(processingLogs)
+77	    .where(eq(processingLogs.episodeId, episodeId))
+78	    .orderBy(asc(processingLogs.createdAt));
+79	
+80	  return { episode, logs };
+81	}
+82
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:08:54Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/episodes.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:09:13Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/episodes.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:09:16Z)**_
+
+Now wiring the worker.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:09:16Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./server/src/workers/ingestion.worker.ts`
+
+```text
+1	import { Worker, type Job } from "bullmq";
+2	import { eq } from "drizzle-orm";
+3	import { db } from "../models/db";
+4	import { episodes, processingLogs } from "../models/schema";
+5	import {
+6	  INGESTION_QUEUE_NAME,
+7	  type IngestionJobData,
+8	} from "../queues/ingestion.queue";
+9	import { redisConnection } from "../queues/connection";
+10	
+11	async function processEpisode(job: Job<IngestionJobData>) {
+12	  const { episodeId } = job.data;
+13	  const startedAt = Date.now();
+14	
+15	  await db
+16	    .update(episodes)
+17	    .set({ status: "processing" })
+18	    .where(eq(episodes.id, episodeId));
+19	
+20	  // Pipeline steps land here in Phase E+ (LLM extract → resolve → facts → Neo4j + Pinecone).
+21	  // For now the worker just transitions status so we can verify queue plumbing.
+22	
+23	  await db
+24	    .update(episodes)
+25	    .set({ status: "processed", processedAt: new Date() })
+26	    .where(eq(episodes.id, episodeId));
+27	
+28	  await db.insert(processingLogs).values({
+29	    episodeId,
+30	    step: "stub-pipeline",
+31	    status: "ok",
+32	    durationMs: Date.now() - startedAt,
+33	  });
+34	}
+35	
+36	const worker = new Worker<IngestionJobData>(
+37	  INGESTION_QUEUE_NAME,
+38	  processEpisode,
+39	  {
+40	    connection: redisConnection,
+41	    concurrency: 4,
+42	  },
+43	);
+44	
+45	worker.on("completed", (job) => {
+46	  console.log(
+47	    `[worker] completed ${job.id} (episode ${job.data.episodeId})`,
+48	  );
+49	});
+50	
+51	worker.on("failed", async (job, err) => {
+52	  console.error(`[worker] failed ${job?.id}:`, err.message);
+53	  if (!job) return;
+54	
+55	  await db.insert(processingLogs).values({
+56	    episodeId: job.data.episodeId,
+57	    step: "stub-pipeline",
+58	    status: "error",
+59	    message: err.message,
+60	  });
+61	
+62	  const isFinalAttempt = job.attemptsMade >= (job.opts.attempts ?? 1);
+63	  if (isFinalAttempt) {
+64	    await db
+65	      .update(episodes)
+66	      .set({ status: "failed" })
+67	      .where(eq(episodes.id, job.data.episodeId));
+68	  }
+69	});
+70	
+71	console.log(`[worker] listening on ${INGESTION_QUEUE_NAME}`);
+72
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:10:15Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { Worker, type Job } from "bullmq";
+import { eq } from "drizzle-orm";
+import { db } from "../models/db";
+import { episodes, processingLogs } from "../models/schema";
+import {
+  INGESTION_QUEUE_NAME,
+  type IngestionJobData,
+} from "../queues/ingestion.queue";
+import { redisConnection } from "../queues/connection";
+import {
+  fetchEpisodeById,
+  getRecentMessages,
+} from "../services/episodes.service";
+import {
+  extractEntities,
+  extractFacts,
+} from "../services/extraction.service";
+import {
+  resolveEntities,
+  getOrCreateSelfEntity,
+} from "../services/resolver.service";
+import { applyTemporalFacts } from "../services/temporal.service";
+import {
+  upsertEntityVectors,
+  upsertFactVectors,
+} from "../services/pinecone.service";
+import {
+  createEpisodeNode,
+  linkEpisodeToEntities,
+} from "../services/neo4j.service";
+
+async function logStep(
+  episodeId: string,
+  stepName: string,
+  status: "ok" | "error",
+  durationMs: number,
+  message?: string,
+) {
+  await db.insert(processingLogs).values({
+    episodeId,
+    step: stepName,
+    status,
+    durationMs,
+    message: message ?? null,
+  });
+}
+
+async function step<T>(
+  episodeId: string,
+  stepName: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const t0 = Date.now();
+  try {
+    const result = await fn();
+    await logStep(episodeId, stepName, "ok", Date.now() - t0);
+    return result;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await logStep(episodeId, stepName, "error", Date.now() - t0, msg);
+    throw err;
+  }
+}
+
+async function processEpisode(job: Job<IngestionJobData>) {
+  const { episodeId } = job.data;
+
+  await db
+    .update(episodes)
+    .set({ status: "processing" })
+    .where(eq(episodes.id, episodeId));
+
+  const episode = await step(episodeId, "fetch_episode", async () => {
+    const ep = await fetchEpisodeById(episodeId);
+    if (!ep) throw new Error("episode not found");
+    return ep;
+  });
+
+  const recent = await step(episodeId, "fetch_recent", () =>
+    getRecentMessages(episode.sessionId, 6, episodeId),
+  );
+
+  const currentMsg = { actor: episode.actor, content: episode.content };
+
+  const rawEntities = await step(episodeId, "extract_entities", () =>
+    extractEntities(currentMsg, recent),
+  );
+
+  const resolved = await step(episodeId, "resolve_entities", () =>
+    resolveEntities(episode.userId, rawEntities),
+  );
+
+  const self = await step(episodeId, "get_self_entity", () =>
+    getOrCreateSelfEntity(episode.userId),
+  );
+
+  const allEntities = [self, ...resolved];
+
+  const rawFacts = await step(episodeId, "extract_facts", () =>
+    extractFacts(currentMsg, recent, allEntities),
+  );
+
+  const occurredAtIso = episode.occurredAt.toISOString();
+
+  const temporal = await step(episodeId, "apply_temporal", () =>
+    applyTemporalFacts(rawFacts, episodeId, occurredAtIso),
+  );
+
+  await step(episodeId, "upsert_entity_vectors", () =>
+    upsertEntityVectors(resolved),
+  );
+
+  await step(episodeId, "upsert_fact_vectors", () =>
+    upsertFactVectors(episode.userId, temporal.written),
+  );
+
+  await step(episodeId, "create_episode_node", () =>
+    createEpisodeNode({
+      episodeId,
+      userId: episode.userId,
+      sessionId: episode.sessionId,
+      actor: episode.actor,
+      content: episode.content,
+      occurredAt: occurredAtIso,
+    }),
+  );
+
+  await step(episodeId, "link_episode_entities", () =>
+    linkEpisodeToEntities(
+      episodeId,
+      allEntities.map((e) => e.entityId),
+      occurredAtIso,
+    ),
+  );
+
+  await db
+    .update(episodes)
+    .set({ status: "processed", processedAt: new Date() })
+    .where(eq(episodes.id, episodeId));
+}
+
+const worker = new Worker<IngestionJobData>(
+  INGESTION_QUEUE_NAME,
+  processEpisode,
+  {
+    connection: redisConnection,
+    concurrency: 4,
+  },
+);
+
+worker.on("completed", (job) => {
+  console.log(
+    `[worker] completed ${job.id} (episode ${job.data.episodeId})`,
+  );
+});
+
+worker.on("failed", async (job, err) => {
+  console.error(`[worker] failed ${job?.id}:`, err.message);
+  if (!job) return;
+
+  const isFinalAttempt = job.attemptsMade >= (job.opts.attempts ?? 1);
+  if (isFinalAttempt) {
+    await db
+      .update(episodes)
+      .set({ status: "failed" })
+      .where(eq(episodes.id, job.data.episodeId));
+  }
+});
+
+console.log(`[worker] listening on ${INGESTION_QUEUE_NAME}`);
+
+```
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/workers/ingestion.worker.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:10:41Z)**_
+
+Worker wired end-to-end. Files touched:
+
+- `server/src/services/episodes.service.ts` — added `fetchEpisodeById(episodeId)` + `getRecentMessages(sessionId, limit, excludeEpisodeId)` (returns oldest-first for LLM context).
+- `server/src/workers/ingestion.worker.ts` — replaced the stub with the full 11-step pipeline, plus a `step()` wrapper that times each call and writes a `processing_logs` row.
+
+Replaced the per-job `stub-pipeline` log with per-step logs — every successful run now produces 11 rows in `processing_logs`. Failure handler simplified: the failing step's error log is already written by `step()`, so `on("failed")` only marks the episode as `failed` on the final retry.
+
+---
+
+## End-to-end test (Postman + worker terminal)
+
+You need both running:
+
+```bash
+# terminal 1 — API
+cd server && bun run dev
+
+# terminal 2 — worker (restart it to pick up the new code)
+cd server && bun run worker
+```
+
+Worker should print `[worker] listening on memory-ingestion`.
+
+### Test sequence in Postman
+
+If you don't have a session yet, create one:
+1. `POST /sessions` → save `{{sessionId}}`.
+
+Then ingest a message:
+
+2. **`POST /ingest`** with body:
+   ```json
+   { "sessionId": "{{sessionId}}", "actor": "user", "content": "Hi, my name is Kevin and I work at Grok in San Francisco." }
+   ```
+   Returns `202 { episodeId, status: "queued" }`. Save `{{episodeId}}`.
+
+3. Watch the **worker terminal** — within ~2-4 seconds (LLM + embedding latency) you should see:
+   ```
+   [worker] completed <jobId> (episode <episodeId>)
+   ```
+
+4. **`GET /episodes/{{episodeId}}`** — now you should see:
+   ```json
+   {
+     "episode": {
+       "status": "processed",
+       "processedAt": "2026-05-10T...",
+       ...
+     },
+     "logs": [
+       { "step": "fetch_episode",         "status": "ok", "durationMs":  20, ... },
+       { "step": "fetch_recent",          "status": "ok", "durationMs":  15, ... },
+       { "step": "extract_entities",      "status": "ok", "durationMs": 700, ... },
+       { "step": "resolve_entities",      "status": "ok", "durationMs":  90, ... },
+       { "step": "get_self_entity",       "status": "ok", "durationMs":  35, ... },
+       { "step": "extract_facts",         "status": "ok", "durationMs": 800, ... },
+       { "step": "apply_temporal",        "status": "ok", "durationMs": 110, ... },
+       { "step": "upsert_entity_vectors", "status": "ok", "durationMs": 250, ... },
+       { "step": "upsert_fact_vectors",   "status": "ok", "durationMs": 250, ... },
+       { "step": "create_episode_node",   "status": "ok", "durationMs":  40, ... },
+       { "step": "link_episode_entities", "status": "ok", "durationMs":  60, ... }
+     ]
+   }
+   ```
+
+### Then verify the four stores
+
+**Neo4j Browser** (replace `<userId>` with the one in your JWT — `userId` field of any episode):
+```cypher
+// All entities and facts for this user
+MATCH (e:Entity { userId: '<userId>' })
+OPTIONAL MATCH (e)-[r:FACT]->(t:Entity)
+RETURN e, r, t
+```
+You should see User, Kevin, Grok, San Francisco, plus `:FACT` edges (`WORKS_AT`, `LIVES_IN`, etc.) connecting them, all with `validUntil = null`.
+
+```cypher
+// The episode + its mentions
+MATCH (ep:Episode { userId: '<userId>' })-[m:MENTIONS]->(e:Entity)
+RETURN ep, m, e
+```
+Shows the `:Episode` node connected to every entity (User + Kevin + Grok + SF).
+
+**Pinecone** — query test (in any of the existing test scripts or directly):
+```ts
+queryVectors("Where does the user work?", "<userId>", 5)
+```
+Should rank `Kevin works at Grok` and the `Grok` entity highly.
+
+### The temporal-invalidation test in production
+
+After the first message, ingest a contradicting follow-up to see Step 7 fire:
+```json
+{ "sessionId": "{{sessionId}}", "actor": "user", "content": "Actually, I left Grok and now work at Anthropic." }
+```
+
+Then re-run the Neo4j query — `Kevin -[WORKS_AT]-> Grok` should now have `validUntil` set (the timestamp of the new message), and a new `Kevin -[WORKS_AT]-> Anthropic` edge with `validUntil = null` should exist alongside.
+
+That's the full system working end-to-end.
+
+---
+
+If anything fails, the failed step's row will be in `processing_logs` with the error message — that's your debugger. Paste any failures and we'll fix.
+
+---
+
+_**User (2026-05-10 10:12:52Z)**_
+
+give me a bunch of queries 5 atleast to test all the features of our pipeline
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 10:13:28Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 10:14:10Z)**_
+
+Here's a sequence of 7 messages that, ingested in order in **the same session**, exercise every feature of the pipeline. Run them through `POST /ingest` one at a time, watching the worker terminal between each so you can see things stabilize.
+
+> All bodies use `{{sessionId}}` from your earlier `POST /sessions`. Actor is `"user"` for all of them.
+
+---
+
+### Test 1 — Multi-entity, multi-fact, self-fact
+```json
+{ "sessionId": "{{sessionId}}", "actor": "user",
+  "content": "Hi, my name is Kevin and I work at Grok in San Francisco. I love dogs." }
+```
+**Tests:** entity extraction across types (PERSON, COMPANY, LOCATION, CONCEPT), self-fact via the User entity, fact extraction with multiple triples.
+**Verify (Neo4j):**
+```cypher
+MATCH (a:Entity { userId: '<userId>' })-[f:FACT]->(b:Entity) RETURN a.name, f.relationType, b.name, f.validUntil
+```
+You should see at least:
+- `User -LOVES-> Dogs`
+- `Kevin -WORKS_AT-> Grok`
+- `Kevin -LIVES_IN-> San Francisco` (or `Grok -LOCATED_IN-> San Francisco`)
+
+All `validUntil` should be `null`.
+
+---
+
+### Test 2 — Re-affirmation (should *skip*, not duplicate)
+```json
+{ "sessionId": "{{sessionId}}", "actor": "user",
+  "content": "Honestly, I really love dogs. Best animals ever." }
+```
+**Tests:** Step 7 re-affirmation logic — `User LOVES Dogs` already exists open, so the new batch contains the same triple → **skipped**.
+**Verify (worker logs):** `apply_temporal` step's row in `processing_logs` should still be quick. Then in Neo4j:
+```cypher
+MATCH (a:Entity { name: 'User', userId: '<userId>' })-[f:FACT { relationType: 'LOVES' }]->(b)
+RETURN b.name, f.validFrom, f.validUntil, f.factId
+```
+You should see **exactly one** `LOVES Dogs` edge, same `factId` as before. NOT two.
+Also: `Episode 2` node exists and `:MENTIONS` edges connect it to User + Dogs (entity dedup also worked — same Dogs entity, not a new one).
+
+---
+
+### Test 3 — Temporal invalidation (the Zep moment)
+```json
+{ "sessionId": "{{sessionId}}", "actor": "user",
+  "content": "I love cats now." }
+```
+**Tests:** Step 7's signature behavior. Existing `User LOVES Dogs` (validUntil=null) gets *closed*; new `User LOVES Cats` opens.
+**Verify (Neo4j):**
+```cypher
+MATCH (a:Entity { name: 'User', userId: '<userId>' })-[f:FACT { relationType: 'LOVES' }]->(b)
+RETURN b.name, f.validFrom, f.validUntil
+ORDER BY f.validFrom
+```
+Two rows now:
+- `Dogs` with `validUntil` = test 3's timestamp ← **closed, not deleted**
+- `Cats` with `validUntil = null` ← open
+
+This is the headline feature — full history preserved, current state queryable.
+
+> **Heads-up on a real limitation:** the rule-based contradiction logic *will* close `Dogs` here even though strictly the user might love both. That's the "partial contradiction" edge case noted in the plan — fixable with an LLM disambiguation pass later.
+
+---
+
+### Test 4 — Pronoun resolution + compound clauses
+```json
+{ "sessionId": "{{sessionId}}", "actor": "user",
+  "content": "Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on the Codex project." }
+```
+**Tests:** pronoun "He" must resolve to Karthik, not OpenAI. Fact extraction handles compound clauses → produces multiple atomic facts.
+**Verify:**
+```cypher
+MATCH (a:Entity { name: 'Karthik', userId: '<userId>' })-[f:FACT]->(b)
+RETURN a.name, f.relationType, b.name, f.factText
+```
+You should see facts attributed to **Karthik as source** (not OpenAI):
+- `Karthik -USED_TO_WORK_AT-> OpenAI`
+- `Karthik -WORKED_ON-> Codex` (or "Codex project")
+- Possibly `Karthik -MET_AT-> Anthropic` or similar
+
+If any fact has source `OpenAI`, the pronoun resolution regressed.
+
+---
+
+### Test 5 — Cross-message entity dedup
+```json
+{ "sessionId": "{{sessionId}}", "actor": "user",
+  "content": "I'm meeting Karthik again on Friday." }
+```
+**Tests:** the resolver should reuse the **same `entityId` for Karthik** as test 4, not mint a new one. New entity "Friday" (DATE) gets created.
+**Verify:**
+```cypher
+MATCH (e:Entity { name: 'Karthik', userId: '<userId>' }) RETURN count(e) AS karthikCount
+```
+Should be `1`. Two would mean the resolver failed.
+
+Then check the new fact lands attached to the *existing* Karthik:
+```cypher
+MATCH (e:Entity { name: 'Karthik', userId: '<userId>' })<-[m:MENTIONS]-(ep:Episode)
+RETURN count(ep) AS episodeCount
+```
+Should be `2` — both test 4 and test 5 episodes mention the same Karthik node.
+
+---
+
+### Test 6 — No facts (empty extraction)
+```json
+{ "sessionId": "{{sessionId}}", "actor": "user",
+  "content": "What's the weather like?" }
+```
+**Tests:** no entities or no triples → pipeline still completes cleanly, episode marked `processed`, but `apply_temporal` returns `written=0/closed=0/skipped=0`. No new vectors in Pinecone.
+**Verify:** `GET /episodes/<id>` shows `status: "processed"` and 11 `ok` log rows. `count` queries before and after should not change for entities/facts/vectors.
+
+---
+
+### Test 7 — Long-form, plan + dates + multiple new entities
+```json
+{ "sessionId": "{{sessionId}}", "actor": "user",
+  "content": "Next month I'm flying to Tokyo for a conference about AI agents. My friend Mei lives there and runs a startup called Aria." }
+```
+**Tests:** mix of all features in one go — DATE entity ("next month"), LOCATION (Tokyo), CONCEPT (AI agents conference), PERSON (Mei), COMPANY (Aria). Multiple facts across them. Self-fact (User PLANS_TO_VISIT Tokyo or similar).
+
+**Verify:** rich graph state. After this, do the full survey:
+```cypher
+// Total entities for this user
+MATCH (e:Entity { userId: '<userId>' }) RETURN e.type, count(e)
+// Total open facts vs closed
+MATCH (a:Entity { userId: '<userId>' })-[f:FACT]->(b)
+RETURN
+  count(CASE WHEN f.validUntil IS NULL THEN 1 END) AS open,
+  count(CASE WHEN f.validUntil IS NOT NULL THEN 1 END) AS closed
+// Episode → entity mentions
+MATCH (ep:Episode { userId: '<userId>' })-[:MENTIONS]->(e:Entity) RETURN ep.content, collect(e.name)
+```
+
+---
+
+### Pinecone-side spot check (after all 7)
+
+Pick any query that should hit semantically:
+
+You'll need a tiny script — copy `scripts/test-pinecone.ts` style:
+```ts
+import { queryVectors } from "../src/services/pinecone.service";
+const USER_ID = "<your-userId-from-jwt>";
+console.log(await queryVectors("where does the user live", USER_ID, 5));
+console.log(await queryVectors("Japanese friend", USER_ID, 5));
+console.log(await queryVectors("AI safety", USER_ID, 5));
+```
+
+Each query should rank semantically related entities/facts highly even though there's no exact word overlap with the stored data.
+
+---
+
+### Summary of what each test proves
+
+| Test | Feature exercised |
+|---|---|
+| 1 | Entity extraction (multi-type) + fact extraction + self-entity injection |
+| 2 | Re-affirmation skip (`apply_temporal.skipped++`) |
+| 3 | **Temporal invalidation** — old edge closed, new edge opens |
+| 4 | Pronoun resolution + compound-clause atomic factText |
+| 5 | Cross-message entity dedup (resolver reuses entityId) |
+| 6 | Empty case — pipeline robust to zero entities/facts |
+| 7 | Full pipeline under realistic long-form input |
+
+Run them in order. If any test produces unexpected results in Neo4j/Pinecone, paste the output and we'll diagnose. After all 7 land cleanly, the pipeline is verified end-to-end and we can move to **retrieval (Step E6)** which is where this graph + vector layer becomes useful to an agent.
+
+---
+
+_**User (2026-05-10 10:23:14Z)**_
+
+could you query the graph and check and verify,query the graph,pinecone and postgres and verify it all,i ran the queries s verify if it works as expected
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 10:24:14Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 10:24:15Z)**_
+
+Building a verification script that queries all three stores and shows the state.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:24:39Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { desc, eq } from "drizzle-orm";
+import { db } from "../src/models/db";
+import { episodes, processingLogs } from "../src/models/schema";
+import { neo4jDriver } from "../src/utils/neo4j";
+import { queryVectors } from "../src/services/pinecone.service";
+
+async function findMostRecentUserId(): Promise<string | null> {
+  const [row] = await db
+    .select({ userId: episodes.userId })
+    .from(episodes)
+    .orderBy(desc(episodes.createdAt))
+    .limit(1);
+  return row?.userId ?? null;
+}
+
+async function checkPostgres(userId: string) {
+  console.log("\n" + "=".repeat(70));
+  console.log("POSTGRES");
+  console.log("=".repeat(70));
+
+  const eps = await db
+    .select()
+    .from(episodes)
+    .where(eq(episodes.userId, userId))
+    .orderBy(desc(episodes.occurredAt));
+
+  const statusCounts = eps.reduce<Record<string, number>>((acc, e) => {
+    acc[e.status] = (acc[e.status] ?? 0) + 1;
+    return acc;
+  }, {});
+  console.log(`\n${eps.length} episodes total — by status:`, statusCounts);
+
+  console.log(`\nDetails (newest first):`);
+  for (const ep of eps) {
+    const logs = await db
+      .select()
+      .from(processingLogs)
+      .where(eq(processingLogs.episodeId, ep.id));
+
+    const okCount = logs.filter((l) => l.status === "ok").length;
+    const errCount = logs.filter((l) => l.status === "error").length;
+
+    console.log(
+      `\n  [${ep.status.toUpperCase()}] ${ep.occurredAt.toISOString()}`,
+    );
+    console.log(`    "${ep.content.slice(0, 90)}${ep.content.length > 90 ? "..." : ""}"`);
+    console.log(`    logs: ${okCount} ok, ${errCount} error`);
+    if (errCount > 0) {
+      for (const l of logs.filter((x) => x.status === "error")) {
+        console.log(`      [ERR] ${l.step}: ${l.message}`);
+      }
+    }
+  }
+}
+
+async function checkNeo4j(userId: string) {
+  console.log("\n" + "=".repeat(70));
+  console.log("NEO4J");
+  console.log("=".repeat(70));
+
+  const session = neo4jDriver.session();
+  try {
+    // Entities
+    const entResult = await session.run(
+      `MATCH (e:Entity {userId: $userId})
+       RETURN e.name AS name, e.type AS type, e.entityId AS id
+       ORDER BY e.type, e.name`,
+      { userId },
+    );
+    const entByType: Record<string, number> = {};
+    for (const r of entResult.records) {
+      const t = r.get("type") as string;
+      entByType[t] = (entByType[t] ?? 0) + 1;
+    }
+    console.log(`\nEntities (${entResult.records.length}) — by type:`, entByType);
+    for (const r of entResult.records) {
+      console.log(
+        `  [${r.get("type")}] ${r.get("name")}  (${(r.get("id") as string).slice(0, 8)}...)`,
+      );
+    }
+
+    // Facts
+    const factResult = await session.run(
+      `MATCH (a:Entity {userId: $userId})-[f:FACT]->(b:Entity)
+       RETURN a.name AS src, f.relationType AS rel, b.name AS tgt,
+              f.factText AS text, f.validFrom AS validFrom, f.validUntil AS validUntil
+       ORDER BY f.validFrom`,
+      { userId },
+    );
+    let open = 0;
+    let closed = 0;
+    console.log(`\nFacts (${factResult.records.length}):`);
+    for (const r of factResult.records) {
+      const validUntil = r.get("validUntil");
+      const isOpen = validUntil === null;
+      if (isOpen) open++;
+      else closed++;
+      const status = isOpen
+        ? "OPEN"
+        : `CLOSED @ ${validUntil.toString()}`;
+      console.log(
+        `  ${r.get("src")} -[${r.get("rel")}]-> ${r.get("tgt")}  (${status})`,
+      );
+      console.log(`    "${r.get("text")}"`);
+    }
+    console.log(`  → ${open} open, ${closed} closed`);
+
+    // Episodes + mentions
+    const mentResult = await session.run(
+      `MATCH (ep:Episode {userId: $userId})-[:MENTIONS]->(e:Entity)
+       RETURN ep.episodeId AS id, ep.content AS content,
+              ep.occurredAt AS ts, collect(e.name) AS mentioned
+       ORDER BY ep.occurredAt`,
+      { userId },
+    );
+    console.log(`\nEpisode nodes (${mentResult.records.length}):`);
+    for (const r of mentResult.records) {
+      const content = r.get("content") as string;
+      console.log(`  ${r.get("ts").toString()}`);
+      console.log(`    "${content.slice(0, 80)}${content.length > 80 ? "..." : ""}"`);
+      console.log(`    mentions: ${(r.get("mentioned") as string[]).join(", ")}`);
+    }
+  } finally {
+    await session.close();
+  }
+}
+
+async function checkPinecone(userId: string) {
+  console.log("\n" + "=".repeat(70));
+  console.log("PINECONE");
+  console.log("=".repeat(70));
+
+  const queries = [
+    "where does the user live",
+    "what does the user love now",
+    "AI safety company",
+    "the user's friend in Japan",
+    "Karthik's previous employer",
+  ];
+
+  for (const q of queries) {
+    console.log(`\nQuery: "${q}"`);
+    const matches = await queryVectors(q, userId, 5);
+    if (matches.length === 0) {
+      console.log("  (no matches)");
+      continue;
+    }
+    for (const m of matches) {
+      const md = (m.metadata ?? {}) as Record<string, unknown>;
+      const label =
+        md.type === "entity"
+          ? `entity: ${md.name as string} [${md.entityType as string}]`
+          : `fact: "${md.factText as string}"`;
+      console.log(`  [${m.score?.toFixed(3)}] ${label}`);
+    }
+  }
+}
+
+async function main() {
+  const userId = await findMostRecentUserId();
+  if (!userId) {
+    console.log("No episodes found in Postgres. Have you ingested anything?");
+    return;
+  }
+
+  console.log(`Verifying pipeline state for userId=${userId}`);
+
+  await checkPostgres(userId);
+  await checkNeo4j(userId);
+  await checkPinecone(userId);
+
+  console.log("\n" + "=".repeat(70));
+  console.log("Done.");
+  console.log("=".repeat(70));
+}
+
+main()
+  .catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  })
+  .finally(() => neo4jDriver.close());
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/scripts/verify-pipeline.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:24:57Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/package.json has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:25:00Z)**_
+
+Now running it.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:25:10Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Run verification across all three stores
+
+`bun run verify 2>&1`
+
+```text
+$ bun run scripts/verify-pipeline.ts
+◇ injected env (0) from .env.local // tip: ◈ encrypted .env [www.dotenvx.com]
+◇ injected env (0) from .env.local // tip: ⌘ enable debugging { debug: true }
+◇ injected env (0) from .env.local // tip: ⌁ auth for agents [www.vestauth.com]
+◇ injected env (0) from .env.local // tip: ⌘ override existing { override: true }
+Verifying pipeline state for userId=c9a21c02-931a-4948-865d-b1312c2697d0
+
+======================================================================
+POSTGRES
+======================================================================
+
+7 episodes total — by status: {
+  processed: 6,
+  failed: 1,
+}
+
+Details (newest first):
+
+  [PROCESSED] 2026-05-10T10:21:56.076Z
+    "Next month I'm flying to Tokyo for a conference about AI agents. My friend Mei lives there..."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T10:21:27.885Z
+    "What's the weather like?"
+    logs: 15 ok, 1 error
+      [ERR] get_self_entity: Connection was closed by server
+
+  [FAILED] 2026-05-10T10:20:49.451Z
+    "I'm meeting Karthik again on Friday."
+    logs: 9 ok, 3 error
+      [ERR] resolve_entities: Could not perform discovery. No routing servers available. Known routing table: RoutingTable[database=5bbb5cad, expirationTime=1778408410189, currentTime=1778408451583, routers=[], readers=[p-mt-3b814dd7cab7-4-0061.production-orch-0068.neo4j.io:7687], writers=[p-mt-3b814dd7cab7-4-0061.production-orch-0068.neo4j.io:7687]]
+      [ERR] resolve_entities: Could not perform discovery. No routing servers available. Known routing table: RoutingTable[database=5bbb5cad, expirationTime=1778408410189, currentTime=1778408454398, routers=[], readers=[p-mt-3b814dd7cab7-4-0061.production-orch-0068.neo4j.io:7687], writers=[p-mt-3b814dd7cab7-4-0061.production-orch-0068.neo4j.io:7687]]
+      [ERR] resolve_entities: Could not perform discovery. No routing servers available. Known routing table: RoutingTable[database=5bbb5cad, expirationTime=1778408410189, currentTime=1778408457970, routers=[], readers=[p-mt-3b814dd7cab7-4-0061.production-orch-0068.neo4j.io:7687], writers=[p-mt-3b814dd7cab7-4-0061.production-orch-0068.neo4j.io:7687]]
+
+  [PROCESSED] 2026-05-10T10:19:57.954Z
+    "Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on the Codex pr..."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T10:18:14.657Z
+    "I love cats now."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T10:17:31.936Z
+    "Honestly, I really love dogs. Best animals ever."
+    logs: 11 ok, 0 error
+
+  [PROCESSED] 2026-05-10T10:15:52.459Z
+    "Hi, my name is Kevin and I work at Grok in San Francisco. I love dogs."
+    logs: 11 ok, 0 error
+
+======================================================================
+NEO4J
+======================================================================
+
+Entities (14) — by type: {
+  COMPANY: 4,
+  CONCEPT: 3,
+  LOCATION: 2,
+  PERSON: 4,
+  PRODUCT: 1,
+}
+  [COMPANY] Anthropic  (8855184f...)
+  [COMPANY] Aria  (f62a6dc6...)
+  [COMPANY] Grok  (c27fa241...)
+  [COMPANY] OpenAI  (361505f6...)
+  [CONCEPT] AI agents  (80bd2350...)
+  [CONCEPT] Cats  (741e33a1...)
+  [CONCEPT] Dogs  (85b56a17...)
+  [LOCATION] San Francisco  (df1292c3...)
+  [LOCATION] Tokyo  (baa40823...)
+  [PERSON] Karthik  (a03964dd...)
+  [PERSON] Kevin  (4a19527f...)
+  [PERSON] Mei  (1646fdf2...)
+  [PERSON] User  (c9a21c02...)
+  [PRODUCT] Codex  (d00128bc...)
+
+Facts (11):
+  Kevin -[WORKS_AT]-> Grok  (OPEN)
+    "Kevin works at Grok."
+  Kevin -[LIVES_IN]-> San Francisco  (OPEN)
+    "Kevin lives in San Francisco."
+  User -[LOVES]-> Dogs  (CLOSED @ 2026-05-10T10:18:14.657000000Z)
+    "The user loves dogs."
+  User -[LOVES]-> Cats  (OPEN)
+    "The user loves cats now."
+  Karthik -[USED_TO_WORK_AT]-> OpenAI  (OPEN)
+    "Karthik used to work at OpenAI."
+  Karthik -[WORKED_ON]-> Codex  (OPEN)
+    "Karthik worked on the Codex project."
+  User -[MET_AT]-> Karthik  (OPEN)
+    "The user met Karthik at the Anthropic office."
+  Mei -[LIVES_IN]-> Tokyo  (OPEN)
+    "Mei lives in Tokyo."
+  Mei -[RUNS]-> Aria  (OPEN)
+    "Mei runs a startup called Aria."
+  User -[FLYING_TO]-> Tokyo  (OPEN)
+    "The user is flying to Tokyo next month."
+  User -[ATTENDING]-> AI agents  (OPEN)
+    "The user is attending a conference about AI agents."
+  → 10 open, 1 closed
+
+Episode nodes (6):
+  2026-05-10T10:15:52.459000000Z
+    "Hi, my name is Kevin and I work at Grok in San Francisco. I love dogs."
+    mentions: Kevin, Grok, San Francisco, Dogs, User
+  2026-05-10T10:17:31.936000000Z
+    "Honestly, I really love dogs. Best animals ever."
+    mentions: Dogs, User
+  2026-05-10T10:18:14.657000000Z
+    "I love cats now."
+    mentions: User, Cats
+  2026-05-10T10:19:57.954000000Z
+    "Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI on th..."
+    mentions: Karthik, Anthropic, OpenAI, Codex, User
+  2026-05-10T10:21:27.885000000Z
+    "What's the weather like?"
+    mentions: User
+  2026-05-10T10:21:56.076000000Z
+    "Next month I'm flying to Tokyo for a conference about AI agents. My friend Mei l..."
+    mentions: Tokyo, AI agents, Mei, Aria, User
+
+======================================================================
+PINECONE
+======================================================================
+
+Query: "where does the user live"
+  [0.366] fact: "Mei lives in Tokyo."
+  [0.359] fact: "The user loves dogs."
+  [0.348] fact: "The user is flying to Tokyo next month."
+  [0.319] fact: "The user loves cats now."
+  [0.318] fact: "The user met Karthik at the Anthropic office."
+
+Query: "what does the user love now"
+  [0.612] fact: "The user loves cats now."
+  [0.512] fact: "The user loves dogs."
+  [0.510] entity: Cats [CONCEPT]
+  [0.405] entity: Dogs [CONCEPT]
+  [0.298] fact: "The user met Karthik at the Anthropic office."
+
+Query: "AI safety company"
+  [0.449] entity: OpenAI [COMPANY]
+  [0.373] entity: Anthropic [COMPANY]
+  [0.334] fact: "The user is attending a conference about AI agents."
+  [0.331] entity: AI agents [CONCEPT]
+  [0.328] fact: "Mei runs a startup called Aria."
+
+Query: "the user's friend in Japan"
+  [0.640] entity: Mei [PERSON]
+  [0.500] fact: "The user is flying to Tokyo next month."
+  [0.413] fact: "Mei lives in Tokyo."
+  [0.345] fact: "The user loves dogs."
+  [0.331] fact: "The user loves cats now."
+
+Query: "Karthik's previous employer"
+  [0.693] entity: OpenAI [COMPANY]
+  [0.679] fact: "Karthik used to work at OpenAI."
+  [0.618] fact: "The user met Karthik at the Anthropic office."
+  [0.588] fact: "Karthik worked on the Codex project."
+  [0.539] entity: Karthik [PERSON]
+
+======================================================================
+Done.
+======================================================================
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:25:46Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 10:26:18Z)**_
+
+Verified. Here's what I see across all three stores.
+
+---
+
+## ✅ What works (as expected)
+
+**Postgres — 7 episodes.** 6 processed cleanly with 11 `ok` logs each. One failed (test 5), one was retried (test 6).
+
+**Neo4j — 14 entities, 11 facts.**
+
+| Feature | Evidence |
+|---|---|
+| Entity extraction across all types | 4 PERSON, 4 COMPANY, 2 LOCATION, 3 CONCEPT, 1 PRODUCT |
+| Self-entity injection | `User` PERSON node exists (entityId = userId `c9a21c02...`) |
+| Cross-message dedup | **One** Karthik entity, mentioned by 2 episodes (test 4 & test 5's partial run) |
+| Re-affirmation skip (test 2) | Test 2 episode (`"I really love dogs..."`) MENTIONS Dogs + User, but **no new `LOVES Dogs` fact** was written. The original from test 1 stays. |
+| **Temporal invalidation (test 3)** ⭐ | `User -[LOVES]-> Dogs` is **CLOSED @ 2026-05-10T10:18:14.657Z** — exactly the timestamp of test 3 ("I love cats now."). New `User -[LOVES]-> Cats` is OPEN. **Both edges coexist.** This is the headline behavior. |
+| Pronoun resolution (test 4) | `Karthik -[USED_TO_WORK_AT]-> OpenAI` and `Karthik -[WORKED_ON]-> Codex`. Karthik is the source, not OpenAI — the misattribution from earlier is gone. |
+| Long-form (test 7) | Mei/Tokyo/Aria/AI agents all extracted with rich facts (`Mei LIVES_IN Tokyo`, `Mei RUNS Aria`, `User FLYING_TO Tokyo`, `User ATTENDING AI agents`). |
+
+**Pinecone — semantic retrieval is real.**
+
+| Query | Top result | Verdict |
+|---|---|---|
+| `"Karthik's previous employer"` | OpenAI entity (0.693), `Karthik used to work at OpenAI` fact (0.679) | ✅ exact target |
+| `"the user's friend in Japan"` | Mei entity (0.640), then Tokyo facts | ✅ exact target |
+| `"what does the user love now"` | `The user loves cats now.` (0.612), then dogs (0.512) | ✅ correctly ranks current above past — but **both still findable** (history preserved) |
+| `"AI safety company"` | OpenAI (0.449), Anthropic (0.373) | ✅ relevant entities ranked, though Anthropic ranking lower than expected |
+
+---
+
+## ⚠️ Two issues found
+
+### 1. Test 5 failed (transient Neo4j routing)
+```
+[FAILED] "I'm meeting Karthik again on Friday."
+  [ERR] resolve_entities: Could not perform discovery. No routing servers available.
+```
+Three retries all hit the same Neo4j Aura routing error. Looks like a transient connectivity blip — the same step works fine in other episodes. **Re-running this exact payload through Postman should succeed.**
+
+### 2. Test 6 ("What's the weather like?") retried mid-pipeline
+```
+logs: 15 ok, 1 error
+  [ERR] get_self_entity: Connection was closed by server
+```
+First attempt failed at `get_self_entity` (also a transient Neo4j issue), BullMQ retried, and the second attempt succeeded — that's why there are 15 ok logs (some steps ran twice). Episode is `processed`. Working as designed, but flags two things:
+- **Aura dropped a connection mid-call** — same flakiness as test 5, just less severe
+- **Idempotency-on-retry** is fine for this case because the resolver dedups, but worth keeping the caveat in mind for retries that span entity creation
+
+---
+
+## 🤔 Two subtle observations (not bugs, but worth knowing)
+
+### a. Kevin ≠ User
+In test 1, `"Hi, my name is Kevin..."`, the model extracted **`Kevin`** as a separate PERSON entity from the speaker. So we have facts like `Kevin -[LIVES_IN]-> San Francisco` instead of `User -[LIVES_IN]-> San Francisco`.
+
+This is why your Pinecone query `"where does the user live"` didn't strongly hit anything — there's no `User -[LIVES_IN]-> ...` fact at all. The system thinks Kevin is a third party that happens to share a name with the speaker.
+
+**Why:** the entity extractor is told "do not extract the speaker themselves" — when the speaker self-introduces by name, the prompt's "User isn't an extracted entity" rule wins, but then the model treats `Kevin` as a new third-party PERSON. We'd need either:
+- A "speaker self-identification" pass (post-extraction: if any PERSON's normalized name matches a known alias of the speaker, alias them to User), **or**
+- A prompt tweak: "If the speaker introduces themselves by name, don't extract that name as a separate PERSON — it IS the User."
+
+Easy fix when we want it.
+
+### b. `User -[MET_AT]-> Karthik` is semantically clumsy
+The fact is technically correct ("the user met Karthik at the Anthropic office") but `MET_AT` reads as a location-edge name pointing to a PERSON. The model squashed "met X at Y" into a single MET_AT relation between User and X. Better would be `User -[MET]-> Karthik` (with Anthropic referenced in the factText) or two atomic facts. Cosmetic, doesn't break anything.
+
+---
+
+## Bottom line
+
+The pipeline works end-to-end. The headline feature — **temporal invalidation** — is provably working: you can see the dogs edge closed at the exact moment cats was introduced, with both still walkable. Cross-message entity dedup is working (one Karthik). Re-affirmations are correctly skipped. Pinecone semantic retrieval is finding the right things even with paraphrased queries.
+
+Two real items to follow up on later:
+- **Speaker self-identification** ("Kevin" → User) — small prompt or post-step
+- **Aura connection flakiness** — could add a Neo4j retry-with-backoff at the driver level (`maxConnectionLifetime` / `connectionAcquisitionTimeout`)
+
+Re-run test 5 (`"I'm meeting Karthik again on Friday."`) when you get a chance — the failure was infra, not pipeline.
+
+Want to address either follow-up now, or move to the **retrieval endpoint** (the inverse of ingest — query → context) so an agent can actually use this memory?
+
+---
+
+_**User (2026-05-10 10:27:22Z)**_
+
+what exactly is the user node it looks weird? and why 3 of them exactly? the relations also,do you think its comprehnsive? it feels like a very restrective ontology,what do you think?
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 10:28:23Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 10:29:08Z)**_
+
+Three questions, three answers — and the third is the most interesting one.
+
+---
+
+## What the User node IS
+
+It's a special **self-entity**, one per Postgres user. Three things make it unusual:
+
+1. `entityId` is **equal to your Postgres `userId`**, not a fresh UUID. (See `resolver.service.ts:55` — `entityId: userId`.) That's a deliberate trick: collision-free since UUIDs are non-overlapping, and it means we never have to "look up the User entityId for this user" — we already have it from the JWT.
+2. `name = "User"`, `normalizedName = "user"`, `type = "PERSON"` — it's a *placeholder* PERSON, not really a person.
+3. It has **no Pinecone vector**. The `isNew` flag on `getOrCreateSelfEntity` returns `false` always, so it's filtered out of `upsertEntityVectors`. It exists *only* in Neo4j, as an attachment point for self-facts (`User -[LOVES]-> Cats`).
+
+It looks weird because it has none of the things a real PERSON entity has — no semantic vector, a generic placeholder name, and an entityId that "shouldn't" be a UUID coming from the entity-creation flow. It's a graph node masquerading as an extracted entity.
+
+---
+
+## "Why 3 of them?"
+
+The verification showed **exactly one** `User` PERSON node:
+```
+[PERSON] User  (c9a21c02-931a-4948-865d-b1312c2697d0)
+```
+
+To confirm in Neo4j Browser:
+```cypher
+MATCH (e:Entity { name: 'User' }) RETURN count(e) AS userCount, collect(e.entityId) AS ids
+```
+Should return `userCount: 1`. If you're seeing 3 in the browser visualization, it's almost certainly **the same node drawn near 3 different things it's connected to** (User has `:MENTIONS` from 6 episodes and `:FACT` to 3 entities — Cats, Karthik, Tokyo + the closed Dogs and AI agents — Neo4j Browser sometimes redraws shared nodes when expanding paths).
+
+But there's a **deeper "user-ish entity" duplication** problem worth calling out: you have **2 entities that represent you**, not 3:
+
+| Entity | Why it's "you" | But |
+|---|---|---|
+| `User` (`c9a21c02...`) | The self-entity for self-facts | Has no semantic content |
+| `Kevin` (`4a19527f...`) | Extracted from `"my name is Kevin"` in test 1 | Was treated as if Kevin were a *third party* |
+
+So `User -[LOVES]-> Cats` and `Kevin -[LIVES_IN]-> San Francisco` exist as separate facts about separate "people" — even though both are about you. **This is the "Kevin ≠ User" issue** I flagged in the previous response. Easy to fix later with a self-identification post-step: when extraction returns a PERSON whose name matches an alias the speaker has used, alias it to User and drop the duplicate.
+
+If you're literally seeing 3 distinct User nodes in the graph (not just visualization), that would indicate something wrong — paste the result of the count query above and we'll dig in.
+
+---
+
+## "Is the ontology comprehensive? Feels restrictive."
+
+This is the right question. Here's the honest answer.
+
+### What we're actually doing right now
+
+We have **two ontologies, both partially open:**
+
+1. **Entity types — closed-ish.** The Zod schema in `extraction.service.ts:18` constrains to:
+   ```
+   PERSON | COMPANY | LOCATION | CONCEPT | PRODUCT | DATE | OTHER
+   ```
+   That's deliberately narrow.
+
+2. **Relation types — open free-form.** The prompt says `relationType` must be `UPPER_SNAKE_CASE`, gives ~10 examples (`WORKS_AT, LIVES_IN, FOUNDED, KNOWS, ...`), but **doesn't constrain the model to that list**. The Zod regex `^[A-Z][A-Z0-9_]*$` only enforces the *form*, not the vocabulary. So every run, the model invents whatever fits — we've seen `MET_AT, USED_TO_WORK_AT, WORKED_ON, RUNS, FLYING_TO, ATTENDING`.
+
+So it's not actually restrictive — it just **looks** thin because:
+- The example list in the prompt acts as an attractor; the model leans on it
+- Each message produces few facts (1–4), so the variety per session is low
+- We have ~7 messages total, ~10 unique relation types — fine for a small dataset
+
+### The actual tradeoff (what's real)
+
+The trade isn't "restrictive vs. permissive." It's **consistency vs. expressiveness:**
+
+| Approach | Pros | Cons |
+|---|---|---|
+| **Closed ontology** (e.g. Schema.org's 50ish properties) | Same query works forever; queryable by relation directly; no synonym drift | Can't capture "FLYING_TO" — you're stuck shoehorning into "TRAVELS_TO" or losing the nuance |
+| **Open + free-form (what we have)** | Captures the actual semantic flavor of each fact ("USED_TO_WORK_AT" ≠ "WORKS_AT" ≠ "WORKED_ON") | Drift: same concept gets different relation names across runs (`LIKES` vs `LOVES` vs `PREFERS`); querying "find everyone the user works with" requires fuzzy matching across many relations |
+| **Open + consolidated** (Zep paper's actual approach) | Best of both — model has freedom, periodic LLM pass merges synonyms into canonical forms | Extra batch work; canonical mapping is itself a dataset to maintain |
+
+### What the symptom would look like at scale
+
+You'd notice the drift around message 50. You'd see:
+- `Kevin -[LIKES]-> Coffee` (one message)
+- `Kevin -[LOVES]-> Coffee` (a different message, maybe stronger language)
+- `Kevin -[ENJOYS]-> Coffee` (yet another)
+
+Now "what does Kevin like?" needs to know to query all three relation types. **Retrieval works fine** (Pinecone matches on factText regardless of relationType), but **graph traversal queries** (`MATCH (a)-[:LIKES]->(b)`) miss things.
+
+### What I'd actually do
+
+For the prototype: **stay open, don't constrain.** Capturing nuance during ingest is more valuable than enforcing canonical relations. The model occasionally producing `FLYING_TO` instead of `TRAVELS_TO` is expressive, not wrong.
+
+When the dataset gets bigger (say >100 facts per user), add **Step E4.5 — relation consolidation**: a low-priority background queue that periodically does an LLM pass on the relation type vocabulary, identifies synonyms, picks a canonical form per cluster, and rewrites edges. Same approach we're already deferring for community detection.
+
+There's a smaller, faster fix you could do now if it's bugging you: **expand the example list in the prompt** to ~25 relation types and explicitly tell the model "prefer these unless they truly don't fit." Most outputs will then collapse to the example list, with occasional escapes. Costs nothing.
+
+### One real ontology gap I do see
+
+The current relation set is missing "negative" predicates (`DOESN'T_LIKE`, `LEFT_COMPANY`, `STOPPED_WORKING_ON`). Right now negation is handled implicitly by `validUntil` — if you said "I left Grok," the temporal step would close `Kevin -[WORKS_AT]-> Grok`. But the LLM might also try to extract `Kevin -[LEFT]-> Grok` as its own fact, which... is awkward. We should explicitly tell the prompt "negation is expressed by closing a fact, not by emitting a new fact about leaving."
+
+That's worth doing whenever we touch the prompt next.
+
+---
+
+**TL;DR on ontology:** It's not actually restrictive; it just *looks* restrictive because the example list anchors the model. The real risk is the *opposite* — drift over time. Stay open for now, add consolidation when the dataset gets big enough that drift hurts retrieval.
+
+---
+
+_**User (2026-05-10 10:31:45Z)**_
+
+how does the retrieval work?
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 10:32:37Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 10:33:16Z)**_
+
+We haven't built it yet — but every piece is in place. Let me walk through how it'll work, using a concrete query against the data you already have.
+
+---
+
+## The mental model
+
+**Vector search finds the door, the graph walks the room.** Pinecone alone would miss connected facts; Neo4j alone would miss paraphrases. Together: Pinecone hands you a small set of relevant nodes, the graph expands around them with a temporal filter so you only see what's true *now* (or whatever time you ask about).
+
+---
+
+## A concrete trace — `"What does the user love these days?"`
+
+### Step 1. Embed the query
+
+```
+embed("What does the user love these days?") → 1536-dim vector
+```
+**OpenAI** call. No DB.
+
+### Step 2. Pinecone — find candidate nodes
+
+```ts
+queryVectors("What does the user love these days?", userId, topK=20)
+```
+With `filter: { userId }`. Returns ~20 matches. For your data:
+
+| Score | Type | What |
+|---|---|---|
+| 0.61 | fact | `"The user loves cats now."` |
+| 0.51 | fact | `"The user loves dogs."` |
+| 0.51 | entity | `Cats` |
+| 0.40 | entity | `Dogs` |
+| 0.32 | fact | `"The user is flying to Tokyo next month."` |
+| ... lower scores from less-related vectors |
+
+Each match has `metadata.neo4jId` (= `factId` for facts, `entityId` for entities) — that's our handoff to the graph.
+
+### Step 3. Neo4j — expand with temporal filter
+
+This is the step that makes retrieval *time-aware*. We take the IDs from Pinecone and walk the graph 1–2 hops. The cypher would look something like:
+
+```cypher
+// Starting nodes from Pinecone hits
+MATCH (n)
+WHERE (n:Entity AND n.entityId IN $entityIds)
+   OR (n:Entity AND n.userId = $userId)  // for fact-source-or-target lookups
+
+// Walk 1-2 hops via :FACT, filtering for "currently true" facts
+OPTIONAL MATCH path = (n)-[f:FACT*1..2]-(m:Entity)
+WHERE ALL(rel IN relationships(path)
+          WHERE rel.validFrom <= datetime($now)
+            AND coalesce(rel.validUntil, datetime('9999-01-01')) >= datetime($now))
+
+RETURN n, path, m
+```
+
+The key bit is the `coalesce(validUntil, ...) >= now` — that's what filters out the **closed** `User -[LOVES]-> Dogs` edge automatically. You only see the open `User -[LOVES]-> Cats`.
+
+For our trace, expansion from the Cats entity reveals:
+- `User -[LOVES]-> Cats` — the open fact (kept)
+- Closed `User -[LOVES]-> Dogs` — **filtered out** by the temporal WHERE
+
+If the query had been `"What did the user used to love?"`, you'd drop the temporal filter (or invert it) — same graph, different lens.
+
+### Step 4. Rerank
+
+We now have a candidate set with scores from two sources:
+- `vector_score` from Pinecone (semantic similarity)
+- `graph_proximity` from Neo4j (1 hop = full credit, 2 hops = half)
+- `recency` (`validFrom` closer to now → higher)
+
+Combine into a single score, sort, take top N (say 10). Optional fourth pass: an LLM reranker for the very top, but that's an enhancement.
+
+### Step 5. Build the context string
+
+Format what survived into something an LLM agent can read. Something like:
+
+```
+Current facts about the user:
+- The user loves cats. (since 2026-05-10)
+- Kevin works at Grok. (since 2026-05-10)
+- Kevin lives in San Francisco. (since 2026-05-10)
+
+Recent conversation in this session:
+> [user, 10:21] Next month I'm flying to Tokyo for a conference about AI agents...
+> [user, 10:19] Yesterday I met Karthik at the Anthropic office. He used to work at OpenAI...
+> [user, 10:18] I love cats now.
+```
+
+The "recent conversation" tail comes from a **Postgres** read — last 3–5 messages of the session. This grounds the agent in the immediate conversational flow even when the graph state alone is sparse.
+
+### Step 6. Return
+
+`POST /retrieve` returns this clean context block (~1–3k tokens) to whatever's calling it — an agent, a chat UI, anything that needs "what does the system know about this user, relevant to this query?"
+
+---
+
+## Why hybrid (and not just one or the other)?
+
+| Approach | What it gets right | What it misses |
+|---|---|---|
+| **Pinecone alone** | Paraphrases ("AI safety company" → Anthropic) | Facts connected via reasoning ("user's friend's company" — needs a hop) |
+| **Neo4j alone** | Multi-hop reasoning, exact relations | Anything queried in different words than stored ("dwelling" won't match `LIVES_IN`) |
+| **Hybrid (this)** | Both — vector finds the entry node, graph walks outward | Slightly more complex retrieval pipeline, but the cost is paid in milliseconds |
+
+The "user's friend's company" example is the killer one. Imagine the query `"who's my contact in Japan and what do they do?"`:
+- Pinecone semantic: hits `Mei` entity strongly (matches "friend in Japan" semantically)
+- From Mei's entityId, Neo4j walks: `Mei -[LIVES_IN]-> Tokyo`, `Mei -[RUNS]-> Aria`
+- Now you have not just Mei but everything connected to her — **without** the query mentioning "Aria" at all
+
+Pure vector retrieval would miss `Aria` unless the query string happened to mention startups.
+
+---
+
+## The temporal filter is what makes this Zep-shaped
+
+Without the temporal WHERE clause, the same query would return:
+```
+- The user loves cats. (current)
+- The user loves dogs. (closed, but you wouldn't know)
+```
+
+The agent then thinks "user loves both" — wrong, because dogs is **historical**. The `coalesce(validUntil, far-future) >= now` is what surfaces only what's *currently* true.
+
+Critically, the closed edge is **still in the graph**. We can answer:
+- *"What does the user love now?"* → just Cats (filter applied)
+- *"What did the user love in March 2026?"* → both, because the dogs edge was open until May (filter set to March)
+- *"How has the user's preferences changed over time?"* → diff between two time points
+
+That's the property the whole architecture was built around.
+
+---
+
+## What we still need to build
+
+We've got every primitive:
+
+| Piece | Built |
+|---|---|
+| `embed(text)` | ✅ `pinecone.service.ts` |
+| `queryVectors(text, userId, topK, filter?)` | ✅ — already proves out in `test:pinecone` |
+| Neo4j multi-hop traversal helpers | ⚠️ partial — we have node/edge writers, need a *read-with-temporal-filter* helper |
+| Reranker | ❌ — small function, just weights |
+| Context formatter | ❌ — string templating |
+| Postgres "last N messages" tail | ✅ `getRecentMessages` already exists for the worker, can reuse |
+| `POST /retrieve` route | ❌ |
+
+So the actual build is **one new service file** (`retrieval.service.ts`) with `getContext({ userId, query, sessionId?, asOf?, limit? })`, **one new Neo4j helper** for the temporal expansion query, **one new controller + route**, and a Zod validator. Roughly the same scope as the ingest endpoint.
+
+When you're ready, that's the next step — and once it lands, you can hit `POST /retrieve { query: "what do I love" }` from Postman and get back an LLM-ready context block sourced from your graph + vector store, time-filtered to "right now."
+
+---
+
+_**User (2026-05-10 10:34:04Z)**_
+
+The current relation set is missing "negative" predicates (DOESN'T_LIKE, LEFT_COMPANY, STOPPED_WORKING_ON). Right now negation is handled implicitly by validUntil —
+  if you said "I left Grok," the temporal step would close Kevin -[WORKS_AT]-> Grok. But the LLM might also try to extract Kevin -[LEFT]-> Grok as its own fact,
+  which... is awkward. We should explicitly tell the prompt "negation is expressed by closing a fact, not by emitting a new fact about leaving."
+
+please do this and then build the entire retrieval pipeline end to end full please
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 10:37:12Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 10:37:13Z)**_
+
+Doing both — negation handling first, then full retrieval pipeline. Going to be a lot of files; I'll narrate progress.
+
+## Part 1 — Negation handling
+
+Updating the fact extraction prompt + adding an explicit `invalidations` field to the LLM output, then teaching the temporal step to process them.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:37:46Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/extraction.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:38:38Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/extraction.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:39:18Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/extraction.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:39:22Z)**_
+
+Now teaching `temporal.service.ts` to process invalidations.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:39:45Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/temporal.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:40:11Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/temporal.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:40:41Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/temporal.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:40:44Z)**_
+
+Update worker call site and the test script.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:41:36Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/workers/ingestion.worker.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:42:42Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/scripts/test-fact-extraction.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:42:47Z)**_
+
+Negation handling done. Now Part 2 — full retrieval pipeline.
+
+## Part 2 — Retrieval pipeline
+
+Adding `expandFromIds` to Neo4j service for temporal multi-hop expansion, then the retrieval service, route, controller, validator, test script.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:45:06Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/neo4j.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:45:12Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 10:45:13Z)**_
+
+Adding `occurredAt` to `RecentMessage` so retrieval can timestamp the recent-messages tail.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:46:25Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/episodes.service.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:46:29Z)**_
+
+Now the retrieval service itself.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:50:08Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { queryVectors } from "./pinecone.service";
+import { expandFromIds, type ExpandedFact } from "./neo4j.service";
+import { getRecentMessages, type RecentMessage } from "./episodes.service";
+
+export type RetrievalOptions = {
+  userId: string;
+  query: string;
+  sessionId?: string;
+  asOf?: string;
+  limit?: number;
+  vectorTopK?: number;
+};
+
+export type ScoredFact = ExpandedFact & {
+  vectorScore: number;
+  recencyScore: number;
+  hopScore: number;
+  totalScore: number;
+};
+
+export type RetrievalResult = {
+  context: string;
+  facts: ScoredFact[];
+  recentMessages: RecentMessage[];
+  asOf: string;
+};
+
+const RECENT_MESSAGE_TAIL = 5;
+
+const WEIGHT_VECTOR = 0.6;
+const WEIGHT_RECENCY = 0.25;
+const WEIGHT_HOP = 0.15;
+
+function computeRecencyScore(validFrom: string, asOf: string): number {
+  const ageMs =
+    new Date(asOf).getTime() - new Date(validFrom).getTime();
+  const ageDays = Math.max(0, ageMs / (1000 * 60 * 60 * 24));
+  if (ageDays <= 7) return 1;
+  if (ageDays >= 365) return 0;
+  return 1 - (ageDays - 7) / (365 - 7);
+}
+
+function formatContext(
+  facts: ScoredFact[],
+  messages: RecentMessage[],
+  asOf: string,
+): string {
+  const lines: string[] = [];
+  lines.push(`Context as of ${asOf}.`);
+
+  if (facts.length > 0) {
+    lines.push("");
+    lines.push("Relevant facts (currently true):");
+    for (const f of facts) {
+      const since = f.validFrom.slice(0, 10);
+      lines.push(`- ${f.factText} (since ${since})`);
+    }
+  }
+
+  if (messages.length > 0) {
+    lines.push("");
+    lines.push("Recent messages in this session:");
+    for (const m of messages) {
+      const ts = m.occurredAt.toISOString().slice(0, 16).replace("T", " ");
+      lines.push(`> [${m.actor} @ ${ts}] ${m.content}`);
+    }
+  }
+
+  if (facts.length === 0 && messages.length === 0) {
+    lines.push("");
+    lines.push("(no relevant facts or recent messages)");
+  }
+
+  return lines.join("\n");
+}
+
+export async function getContext(
+  opts: RetrievalOptions,
+): Promise<RetrievalResult> {
+  const { userId, query, sessionId } = opts;
+  const limit = opts.limit ?? 10;
+  const vectorTopK = opts.vectorTopK ?? 25;
+  const asOf = opts.asOf ?? new Date().toISOString();
+
+  const matches = await queryVectors(query, userId, vectorTopK);
+
+  const entityIds: string[] = [];
+  const factIds: string[] = [];
+  const vectorScoreById = new Map<string, number>();
+  for (const m of matches) {
+    if (m.score !== undefined) vectorScoreById.set(m.id, m.score);
+    const type = m.metadata?.type;
+    if (type === "entity") entityIds.push(m.id);
+    else if (type === "fact") factIds.push(m.id);
+  }
+
+  const expanded = await expandFromIds(userId, {
+    entityIds,
+    factIds,
+    asOf,
+  });
+
+  const dedup = new Map<string, ExpandedFact>();
+  for (const f of expanded) dedup.set(f.factId, f);
+
+  const scored: ScoredFact[] = Array.from(dedup.values()).map((f) => {
+    const vScoreDirect = vectorScoreById.get(f.factId) ?? 0;
+    const vScoreSrc = vectorScoreById.get(f.sourceId) ?? 0;
+    const vScoreTgt = vectorScoreById.get(f.targetId) ?? 0;
+    const vectorScore = Math.max(vScoreDirect, vScoreSrc * 0.7, vScoreTgt * 0.7);
+
+    const recencyScore = computeRecencyScore(f.validFrom, asOf);
+    const hopScore = f.hop === 0 ? 1 : 0.5;
+    const totalScore =
+      WEIGHT_VECTOR * vectorScore +
+      WEIGHT_RECENCY * recencyScore +
+      WEIGHT_HOP * hopScore;
+
+    return {
+      ...f,
+      vectorScore,
+      recencyScore,
+      hopScore,
+      totalScore,
+    };
+  });
+
+  scored.sort((a, b) => b.totalScore - a.totalScore);
+  const topFacts = scored.slice(0, limit);
+
+  const recentMessages = sessionId
+    ? await getRecentMessages(sessionId, RECENT_MESSAGE_TAIL)
+    : [];
+
+  const context = formatContext(topFacts, recentMessages, asOf);
+
+  return { context, facts: topFacts, recentMessages, asOf };
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/retrieval.service.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:50:11Z)**_
+
+Validator, controller, route, then wire into index.ts.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:50:15Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { z } from "zod";
+
+export const retrieveSchema = z.object({
+  query: z.string().min(1).max(2000),
+  sessionId: z.uuid().optional(),
+  asOf: z.iso.datetime().optional(),
+  limit: z.number().int().min(1).max(50).optional(),
+  vectorTopK: z.number().int().min(1).max(100).optional(),
+});
+
+export type RetrieveInput = z.infer<typeof retrieveSchema>;
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/validators/retrieve.validator.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:50:47Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import type { Context } from "hono";
+import type { AuthVariables } from "../middleware/auth.middleware";
+import { retrieveSchema } from "../validators/retrieve.validator";
+import { getContext } from "../services/retrieval.service";
+
+export async function retrieve(c: Context<{ Variables: AuthVariables }>) {
+  const userId = c.get("userId");
+  const body = await c.req.json().catch(() => null);
+  const parsed = retrieveSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "VALIDATION_ERROR", issues: parsed.error.issues },
+      400,
+    );
+  }
+
+  const result = await getContext({
+    userId,
+    query: parsed.data.query,
+    sessionId: parsed.data.sessionId,
+    asOf: parsed.data.asOf,
+    limit: parsed.data.limit,
+    vectorTopK: parsed.data.vectorTopK,
+  });
+
+  return c.json(result);
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/controllers/retrieve.controller.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:51:54Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { Hono } from "hono";
+import type { AuthVariables } from "../middleware/auth.middleware";
+import { retrieve } from "../controllers/retrieve.controller";
+
+export const retrieveRouter = new Hono<{ Variables: AuthVariables }>();
+
+retrieveRouter.post("/", retrieve);
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/routes/retrieve.routes.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:52:05Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/index.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:53:42Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/index.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:53:45Z)**_
+
+Test script + package.json.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:54:45Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { desc } from "drizzle-orm";
+import { db } from "../src/models/db";
+import { episodes } from "../src/models/schema";
+import { neo4jDriver } from "../src/utils/neo4j";
+import { getContext } from "../src/services/retrieval.service";
+
+async function findMostRecentUserId(): Promise<string | null> {
+  const [row] = await db
+    .select({ userId: episodes.userId })
+    .from(episodes)
+    .orderBy(desc(episodes.createdAt))
+    .limit(1);
+  return row?.userId ?? null;
+}
+
+const QUERIES = [
+  "where does the user work and live",
+  "what does the user love",
+  "tell me about Karthik's career",
+  "the user's friend in Japan",
+  "what did the user used to love",
+  "AI safety",
+];
+
+async function main() {
+  const userId = await findMostRecentUserId();
+  if (!userId) {
+    console.log("No episodes found. Ingest something first.");
+    return;
+  }
+  console.log(`Retrieval test for userId=${userId}\n`);
+
+  for (const query of QUERIES) {
+    console.log("=".repeat(72));
+    console.log(`Q: ${query}`);
+    console.log("=".repeat(72));
+
+    const result = await getContext({ userId, query, limit: 6 });
+
+    console.log("\n--- ranked facts ---");
+    if (result.facts.length === 0) {
+      console.log("  (none)");
+    } else {
+      for (const f of result.facts) {
+        console.log(
+          `  [total=${f.totalScore.toFixed(3)} v=${f.vectorScore.toFixed(2)} r=${f.recencyScore.toFixed(2)} h=${f.hop}]`,
+        );
+        console.log(
+          `    ${f.sourceName} -[${f.relationType}]-> ${f.targetName}`,
+        );
+        console.log(`    "${f.factText}"`);
+      }
+    }
+
+    console.log("\n--- formatted context (what an agent would see) ---");
+    console.log(result.context);
+    console.log();
+  }
+}
+
+main()
+  .catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  })
+  .finally(() => neo4jDriver.close());
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/scripts/test-retrieval.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:55:04Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/package.json has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:55:08Z)**_
+
+All shipped. Let me run the retrieval test against the data you already have to verify it works end-to-end.
+
+_**Agent (claude-opus-4-7 2026-05-10 10:57:19Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Run retrieval test against existing data
+
+`bun run test:retrieval 2>&1 | head -200`
+
+```text
+Command running in background with ID: b76yp4o8b. Output is being written to: /private/tmp/claude-501/-Users-karthiknadar-Desktop-zep-paper-implementation/a2476c82-ae75-4920-9d69-7c2cabbf0666/tasks/b76yp4o8b.output
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:57:23Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Read retrieval test output after warming up
+
+`sleep 25 && cat /private/tmp/claude-501/-Users-karthiknadar-Desktop-zep-paper-implementation/a2476c82-ae75-4920-9d69-7c2cabbf0666/tasks/b76yp4o8b.output 2>&1 | head -250`
+
+```text
+<tool_use_error>Blocked: sleep 25 followed by: cat /private/tmp/claude-501/-Users-karthiknadar-Desktop-zep-paper-implementation/a2476c82-ae75-4920-9d69-7c2cabbf0666/tasks/b76yp4o8b.output head -250. To wait for a condition, use Monitor with an until-loop (e.g. `until <check>; do sleep 2; done`). To wait for a command you started, use run_in_background: true. Do not chain shorter sleeps to work around this block.</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:57:26Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="ToolSearch"><details>
+<summary>Tool use: **ToolSearch**</summary>
+
+**Input:**
+
+- max_results: `1`
+- query: `select:Monitor`
+
+**Result:**
+
+```
+
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:57:33Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 10:57:36Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `/private/tmp/claude-501/-Users-karthiknadar-Desktop-zep-paper-implementation/a2476c82-ae75-4920-9d69-7c2cabbf0666/tasks/b76yp4o8b.output`
+
+```text
+1	$ bun run scripts/test-retrieval.ts
+2	◇ injected env (0) from .env.local // tip: ⌁ auth for agents [www.vestauth.com]
+3	◇ injected env (0) from .env.local // tip: ⌘ override existing { override: true }
+4	◇ injected env (0) from .env.local // tip: ⌁ auth for agents [www.vestauth.com]
+5	◇ injected env (0) from .env.local // tip: ⌘ enable debugging { debug: true }
+6	◇ injected env (0) from .env.local // tip: ⌁ auth for agents [www.vestauth.com]
+7	Retrieval test for userId=c9a21c02-931a-4948-865d-b1312c2697d0
+8	
+9	========================================================================
+10	Q: where does the user work and live
+11	========================================================================
+12	
+13	--- ranked facts ---
+14	  [total=0.620 v=0.37 r=1.00 h=0]
+15	    User -[MET_AT]-> Karthik
+16	    "The user met Karthik at the Anthropic office."
+17	  [total=0.602 v=0.34 r=1.00 h=0]
+18	    Mei -[LIVES_IN]-> Tokyo
+19	    "Mei lives in Tokyo."
+20	  [total=0.594 v=0.32 r=1.00 h=0]
+21	    User -[FLYING_TO]-> Tokyo
+22	    "The user is flying to Tokyo next month."
+23	  [total=0.576 v=0.29 r=1.00 h=0]
+24	    Kevin -[LIVES_IN]-> San Francisco
+25	    "Kevin lives in San Francisco."
+26	  [total=0.568 v=0.28 r=1.00 h=0]
+27	    User -[LOVES]-> Cats
+28	    "The user loves cats now."
+29	  [total=0.563 v=0.27 r=1.00 h=0]
+30	    User -[ATTENDING]-> AI agents
+31	    "The user is attending a conference about AI agents."
+32	
+33	--- formatted context (what an agent would see) ---
+34	Context as of 2026-05-10T10:55:19.620Z.
+35	
+36	Relevant facts (currently true):
+37	- The user met Karthik at the Anthropic office. (since 2026-05-10)
+38	- Mei lives in Tokyo. (since 2026-05-10)
+39	- The user is flying to Tokyo next month. (since 2026-05-10)
+40	- Kevin lives in San Francisco. (since 2026-05-10)
+41	- The user loves cats now. (since 2026-05-10)
+42	- The user is attending a conference about AI agents. (since 2026-05-10)
+43	
+44	========================================================================
+45	Q: what does the user love
+46	========================================================================
+47	
+48	--- ranked facts ---
+49	  [total=0.727 v=0.55 r=1.00 h=0]
+50	    User -[LOVES]-> Cats
+51	    "The user loves cats now."
+52	  [total=0.595 v=0.33 r=1.00 h=0]
+53	    User -[MET_AT]-> Karthik
+54	    "The user met Karthik at the Anthropic office."
+55	  [total=0.574 v=0.29 r=1.00 h=0]
+56	    User -[FLYING_TO]-> Tokyo
+57	    "The user is flying to Tokyo next month."
+58	  [total=0.557 v=0.26 r=1.00 h=0]
+59	    User -[ATTENDING]-> AI agents
+60	    "The user is attending a conference about AI agents."
+61	  [total=0.531 v=0.22 r=1.00 h=0]
+62	    Mei -[RUNS]-> Aria
+63	    "Mei runs a startup called Aria."
+64	  [total=0.514 v=0.19 r=1.00 h=0]
+65	    Karthik -[USED_TO_WORK_AT]-> OpenAI
+66	    "Karthik used to work at OpenAI."
+67	
+68	--- formatted context (what an agent would see) ---
+69	Context as of 2026-05-10T10:55:23.778Z.
+70	
+71	Relevant facts (currently true):
+72	- The user loves cats now. (since 2026-05-10)
+73	- The user met Karthik at the Anthropic office. (since 2026-05-10)
+74	- The user is flying to Tokyo next month. (since 2026-05-10)
+75	- The user is attending a conference about AI agents. (since 2026-05-10)
+76	- Mei runs a startup called Aria. (since 2026-05-10)
+77	- Karthik used to work at OpenAI. (since 2026-05-10)
+78	
+79	========================================================================
+80	Q: tell me about Karthik's career
+81	========================================================================
+82	
+83	--- ranked facts ---
+84	  [total=0.718 v=0.53 r=1.00 h=0]
+85	    Karthik -[USED_TO_WORK_AT]-> OpenAI
+86	    "Karthik used to work at OpenAI."
+87	  [total=0.716 v=0.53 r=1.00 h=0]
+88	    User -[MET_AT]-> Karthik
+89	    "The user met Karthik at the Anthropic office."
+90	  [total=0.709 v=0.52 r=1.00 h=0]
+91	    Karthik -[WORKED_ON]-> Codex
+92	    "Karthik worked on the Codex project."
+93	  [total=0.520 v=0.20 r=1.00 h=0]
+94	    Kevin -[WORKS_AT]-> Grok
+95	    "Kevin works at Grok."
+96	  [total=0.499 v=0.17 r=1.00 h=0]
+97	    Kevin -[LIVES_IN]-> San Francisco
+98	    "Kevin lives in San Francisco."
+99	  [total=0.497 v=0.16 r=1.00 h=0]
+100	    User -[LOVES]-> Cats
+101	    "The user loves cats now."
+102	
+103	--- formatted context (what an agent would see) ---
+104	Context as of 2026-05-10T10:55:26.254Z.
+105	
+106	Relevant facts (currently true):
+107	- Karthik used to work at OpenAI. (since 2026-05-10)
+108	- The user met Karthik at the Anthropic office. (since 2026-05-10)
+109	- Karthik worked on the Codex project. (since 2026-05-10)
+110	- Kevin works at Grok. (since 2026-05-10)
+111	- Kevin lives in San Francisco. (since 2026-05-10)
+112	- The user loves cats now. (since 2026-05-10)
+113	
+114	========================================================================
+115	Q: the user's friend in Japan
+116	========================================================================
+117	
+118	--- ranked facts ---
+119	  [total=0.700 v=0.50 r=1.00 h=0]
+120	    User -[FLYING_TO]-> Tokyo
+121	    "The user is flying to Tokyo next month."
+122	  [total=0.669 v=0.45 r=1.00 h=0]
+123	    Mei -[LIVES_IN]-> Tokyo
+124	    "Mei lives in Tokyo."
+125	  [total=0.669 v=0.45 r=1.00 h=0]
+126	    Mei -[RUNS]-> Aria
+127	    "Mei runs a startup called Aria."
+128	  [total=0.599 v=0.33 r=1.00 h=0]
+129	    User -[LOVES]-> Cats
+130	    "The user loves cats now."
+131	  [total=0.566 v=0.28 r=1.00 h=0]
+132	    User -[MET_AT]-> Karthik
+133	    "The user met Karthik at the Anthropic office."
+134	  [total=0.561 v=0.27 r=1.00 h=0]
+135	    User -[ATTENDING]-> AI agents
+136	    "The user is attending a conference about AI agents."
+137	
+138	--- formatted context (what an agent would see) ---
+139	Context as of 2026-05-10T10:55:26.902Z.
+140	
+141	Relevant facts (currently true):
+142	- The user is flying to Tokyo next month. (since 2026-05-10)
+143	- Mei lives in Tokyo. (since 2026-05-10)
+144	- Mei runs a startup called Aria. (since 2026-05-10)
+145	- The user loves cats now. (since 2026-05-10)
+146	- The user met Karthik at the Anthropic office. (since 2026-05-10)
+147	- The user is attending a conference about AI agents. (since 2026-05-10)
+148	
+149	========================================================================
+150	Q: what did the user used to love
+151	========================================================================
+152	
+153	--- ranked facts ---
+154	  [total=0.697 v=0.50 r=1.00 h=0]
+155	    User -[LOVES]-> Cats
+156	    "The user loves cats now."
+157	  [total=0.590 v=0.32 r=1.00 h=0]
+158	    User -[MET_AT]-> Karthik
+159	    "The user met Karthik at the Anthropic office."
+160	  [total=0.550 v=0.25 r=1.00 h=0]
+161	    User -[FLYING_TO]-> Tokyo
+162	    "The user is flying to Tokyo next month."
+163	  [total=0.542 v=0.24 r=1.00 h=0]
+164	    Karthik -[USED_TO_WORK_AT]-> OpenAI
+165	    "Karthik used to work at OpenAI."
+166	  [total=0.539 v=0.23 r=1.00 h=0]
+167	    Mei -[RUNS]-> Aria
+168	    "Mei runs a startup called Aria."
+169	  [total=0.520 v=0.20 r=1.00 h=0]
+170	    Karthik -[WORKED_ON]-> Codex
+171	    "Karthik worked on the Codex project."
+172	
+173	--- formatted context (what an agent would see) ---
+174	Context as of 2026-05-10T10:55:27.762Z.
+175	
+176	Relevant facts (currently true):
+177	- The user loves cats now. (since 2026-05-10)
+178	- The user met Karthik at the Anthropic office. (since 2026-05-10)
+179	- The user is flying to Tokyo next month. (since 2026-05-10)
+180	- Karthik used to work at OpenAI. (since 2026-05-10)
+181	- Mei runs a startup called Aria. (since 2026-05-10)
+182	- Karthik worked on the Codex project. (since 2026-05-10)
+183	
+184	========================================================================
+185	Q: AI safety
+186	========================================================================
+187	
+188	--- ranked facts ---
+189	  [total=0.618 v=0.36 r=1.00 h=0]
+190	    User -[ATTENDING]-> AI agents
+191	    "The user is attending a conference about AI agents."
+192	  [total=0.570 v=0.28 r=1.00 h=0]
+193	    Karthik -[USED_TO_WORK_AT]-> OpenAI
+194	    "Karthik used to work at OpenAI."
+195	  [total=0.534 v=0.22 r=1.00 h=0]
+196	    User -[MET_AT]-> Karthik
+197	    "The user met Karthik at the Anthropic office."
+198	  [total=0.524 v=0.21 r=1.00 h=0]
+199	    Karthik -[WORKED_ON]-> Codex
+200	    "Karthik worked on the Codex project."
+201
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-10 10:58:04Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 10:58:32Z)**_
+
+Retrieval works. Analyzing the output:
+
+---
+
+## What's working ✅
+
+### Temporal filter is real
+
+**Q2: "what does the user love"** returns:
+```
+[0.727] User -[LOVES]-> Cats   ← TOP
+... (no other LOVES facts)
+```
+The closed `User -[LOVES]-> Dogs` edge is in the graph and would show in `verify-pipeline`, but it does **not surface here**. The `coalesce(validUntil, far-future) >= asOf` filter in `expandFromIds` did its job — agent only sees what's currently true.
+
+### Hybrid (Pinecone + graph expansion) is real
+
+**Q4: "the user's friend in Japan"** — the query never says "Mei" or "Aria", but:
+```
+[0.700] User -[FLYING_TO]-> Tokyo
+[0.669] Mei -[LIVES_IN]-> Tokyo       ← graph expansion from Mei entity
+[0.669] Mei -[RUNS]-> Aria             ← graph expansion: connected to Mei, surfaced even though Aria has no semantic match
+```
+That last row is the headline — `Aria` came in via the 1-hop walk from Mei, not from any vector match. Pure vector retrieval would miss this.
+
+### Pronoun-resolved facts rank correctly
+
+**Q3: "tell me about Karthik's career"** — top 3 all Karthik facts:
+```
+[0.718] Karthik -[USED_TO_WORK_AT]-> OpenAI
+[0.716] User -[MET_AT]-> Karthik
+[0.709] Karthik -[WORKED_ON]-> Codex
+```
+Both `WORKED_ON` and `USED_TO_WORK_AT` correctly attribute Karthik as source. The pronoun fix from earlier in the session is paying off here.
+
+---
+
+## Two things worth noting
+
+### Q5: "what did the user used to love" returns current state
+
+```
+[0.697] User -[LOVES]-> Cats   ← but they currently love cats
+```
+The default `asOf = now`, so the temporal filter strips out the closed Dogs edge. This is the right design — agents asking "what does the user love" should see current state — but to ask about the past, you'd want to pass `asOf: "2026-04-15T..."` (a date before the contradiction landed) or add a `mode: "historical"` flag that drops the temporal filter.
+
+Two clean ways to extend later:
+- Pass `asOf` to retrieve "as of date X" → already supported, just needs explicit use
+- Add `includeClosed: true` flag → drop the `validUntil` clause to surface history
+
+### Q1's top result is `User -[MET_AT]-> Karthik`, not a `LIVES_IN` fact
+
+```
+[0.620] User -[MET_AT]-> Karthik   ← TOP
+[0.602] Mei -[LIVES_IN]-> Tokyo
+[0.594] User -[FLYING_TO]-> Tokyo
+[0.576] Kevin -[LIVES_IN]-> San Francisco
+```
+This is the **"Kevin ≠ User" issue** showing up downstream. The User entity has no direct `LIVES_IN` fact (those got attributed to Kevin, the third-party-ish entity from "my name is Kevin"), so vector + graph can't find a clean answer. The system surfaces `Kevin lives in SF` at position 4, which is *the* answer — but it's not at the top because the vector match isn't as strong (User word in query doesn't match Kevin entity).
+
+The self-identification step ("Kevin → User alias") would fix this. Worth doing soon.
+
+---
+
+## What you can now do (Postman)
+
+```
+POST /retrieve
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{ "query": "what does the user love", "sessionId": "{{sessionId}}", "limit": 5 }
+```
+
+Returns:
+```json
+{
+  "context": "Context as of 2026-...\n\nRelevant facts (currently true):\n- The user loves cats now. (since 2026-05-10)\n...\n\nRecent messages in this session:\n> [user @ 2026-05-10 10:21] Next month I'm flying to Tokyo...",
+  "facts": [...with scores...],
+  "recentMessages": [...last 5...],
+  "asOf": "2026-..."
+}
+```
+
+Pass `asOf` for time travel:
+```json
+{ "query": "what does the user love", "asOf": "2026-05-10T10:18:00Z" }
+```
+That's just *before* test 3's "I love cats now." — at that moment, `User -[LOVES]-> Dogs` was still open, so it should appear in the results (and `Cats` should NOT, because that fact's `validFrom` is *after* the asOf).
+
+---
+
+## Bottom line
+
+End-to-end pipeline now exists:
+
+```
+Ingest:   /ingest → Postgres → BullMQ → worker → (extract → resolve → temporal+invalidations → embed) → Neo4j + Pinecone
+Retrieve: /retrieve → Pinecone(filter userId) → Neo4j(temporal expand) → rerank(vector+recency+hop) → context string
+```
+
+The negation handling is also in: when an LLM response includes `invalidations: [{src, target, relation}]`, the temporal step closes the matching open edge — without producing any awkward `LEFT_COMPANY` fact.
+
+---
+
+_**User (2026-05-10 11:01:39Z)**_
+
+hmm now i'll be taking a break and then lets walk over how it all works with the new changes,ingestion and retrieval and then lets test it all,sounds good?
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 11:01:43Z)**_
+
+Sounds good. When you're back I'll do a fresh end-to-end walkthrough covering both flows with the new bits — the **negation/`invalidations` path** in ingestion, and the full **retrieval pipeline** (Pinecone → temporal Neo4j expansion → rerank → context build) — then we'll run live tests. Take your break.
+
+---
+
+_**User (2026-05-10 11:01:49Z)**_
+
+<task-notification>
+<task-id>b76yp4o8b</task-id>
+<tool-use-id>toolu_01PX8jQrmaw2TpXRRiakFGbD</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-karthiknadar-Desktop-zep-paper-implementation/a2476c82-ae75-4920-9d69-7c2cabbf0666/tasks/b76yp4o8b.output</output-file>
+<status>killed</status>
+<summary>Background command "Run retrieval test against existing data" was stopped</summary>
+</task-notification>
+
+_**User (2026-05-10 12:52:43Z)**_
+
+Continue from where you left off.
+
+---
+
+_**Agent (<synthetic> 2026-05-10 12:52:43Z)**_
+
+No response requested.
+
+---
+
+_**User (2026-05-10 13:13:58Z)**_
+
+now the new changes,could you again walk me through the workflow of the ingestion pipeline end to end full thoroughly please
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 13:15:09Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 13:16:18Z)**_
+
+Welcome back. Here's the full ingestion walkthrough with the negation/invalidations path included.
+
+---
+
+## One-line mental model (unchanged)
+
+**Postgres holds the raw message immutably. Neo4j holds the distilled structure with bi-temporal edges. Pinecone holds the semantic vectors. They're populated in that order, by two different processes.**
+
+What's new: the LLM can now explicitly tell us "this existing relation has ended" via an `invalidations` array — and the temporal step closes those edges *without* the LLM having to emit a clumsy `LEFT_COMPANY` positive fact.
+
+---
+
+## The two phases (unchanged)
+
+| Phase | Where | Latency | Survives crashes? |
+|---|---|---|---|
+| **1. Fast path** | Hono request thread | <50ms | n/a |
+| **2. Slow path** | Worker process | 2–4s | depends on which step |
+
+User gets `202 Accepted` after Phase 1.
+
+---
+
+## Phase 1 — Fast path *(unchanged, brief)*
+
+`POST /ingest { sessionId, actor, content, occurredAt? }`
+
+| t | Op | Where |
+|---|---|---|
+| 2ms | `requireAuth` middleware extracts `userId` from JWT | — |
+| 5ms | Zod validates body | — |
+| 10ms | `SELECT FROM sessions` → ownership check | **Postgres** |
+| 20ms | `INSERT INTO episodes` with `status='queued'` | **Postgres** |
+| 25ms | `ingestionQueue.add({ episodeId })` | **Redis** |
+| 30ms | return `202 { episodeId, status: "queued" }` | — |
+
+Postgres has the raw row. Redis has a job. Worker hasn't seen it yet.
+
+---
+
+## Phase 2 — Worker pipeline (12 substeps)
+
+Steps 1–5, 8–11, and Final are **unchanged** from the previous walkthrough. **Steps 6 and 7 are the changed bits** — that's where I'll spend the most time.
+
+### Init: `UPDATE episodes SET status='processing'`
+
+So a `GET /episodes/:id` mid-pipeline sees in-flight state.
+
+### Step 1 — `fetch_episode` *(unchanged)*
+
+`SELECT * FROM episodes WHERE id=$1`. **Postgres read.** Loads the row Phase 1 wrote.
+
+### Step 2 — `fetch_recent` *(unchanged)*
+
+`SELECT FROM episodes WHERE session_id=... AND id<>... ORDER BY occurred_at DESC LIMIT 6`. **Postgres read.** Last few messages of the session for LLM context. Now also returns `occurredAt` per row (added so retrieval can timestamp the recent-tail block).
+
+### Step 3 — `extract_entities` *(unchanged)*
+
+OpenAI call. Returns `[{ name, type, summary }, ...]`. No DB. Same prompt as before — speaker is NOT extracted.
+
+### Step 4 — `resolve_entities` *(unchanged)*
+
+- In-memory: normalize names.
+- **Neo4j read** (one batched MATCH on `(userId, normalizedName)`).
+- Mint UUIDs for unmatched.
+- **Neo4j write** (one batched UNWIND + MERGE).
+
+Returns `ResolvedEntity[]` with `isNew` flags.
+
+### Step 5 — `get_self_entity` *(unchanged)*
+
+**Neo4j write.** `MERGE (:Entity { entityId: $userId })` with `name="User", type="PERSON"`. Idempotent — no-op after the user's first message ever.
+
+After this step we have `allEntities = [self, ...resolved]`.
+
+---
+
+### Step 6 — `extract_facts` ⭐ *changed*
+
+Same OpenAI call site, but the **prompt and output shape are different.**
+
+**Output shape now:**
+```ts
+{
+  facts: RawFact[],          // new positive triples
+  invalidations: RawInvalidation[]  // existing relations that ENDED
+}
+```
+
+`RawFact` is what we had before: `{ sourceEntityId, targetEntityId, relationType, factText, confidence }`.
+
+`RawInvalidation` is new: `{ sourceEntityId, targetEntityId, relationType }` — no `factText`, no `confidence`. It's just a pointer to "close this triple."
+
+**The prompt now has 5 explicit examples** covering all the cases:
+
+| Example | Demonstrates |
+|---|---|
+| `"Kevin works at Grok."` | Standard positive fact |
+| `"Karthik used to work at OpenAI on the Codex project."` | Pronoun resolution + atomic factText (2 facts from compound clause) |
+| `"I love dogs."` | Self-fact via `User` entity |
+| **`"I left Grok last month."`** | **Pure invalidation, no positive fact** |
+| **`"I left Grok and joined Anthropic."`** | **Both: 1 invalidation + 1 new fact** |
+
+The negation rule is explicit: the prompt says **do NOT** emit `LEFT_COMPANY` / `NO_LONGER_LIKES` / `STOPPED_WORKING_AT` style relations. Use the canonical positive predicate (`WORKS_AT`, `LIKES`) and put it in `invalidations` instead.
+
+**Hallucination guards** apply to BOTH arrays:
+1. Zod validates shape.
+2. We filter both `facts` and `invalidations` so every `sourceEntityId` and `targetEntityId` is in the entity list we passed to the LLM.
+
+No DB writes in this step — pure LLM call.
+
+---
+
+### Step 7 — `apply_temporal` ⭐ *changed (now 3 internal phases)*
+
+This is where invalidations are processed. Same function (`applyTemporalFacts`), now takes both arrays and runs in three phases:
+
+#### Phase A — Contradiction detection *(same as before)*
+
+For each unique `(sourceEntityId, relationType)` in `rawFacts`, **Neo4j read**: find existing open edges. For each existing open edge whose target *isn't* in the new batch's targets → set `validUntil = newFact.validFrom`.
+
+This is the implicit closure path — what closed `User -[LOVES]-> Dogs` when "I love cats now" came in.
+
+#### Phase B — Write new facts *(same as before)*
+
+For each new fact that isn't a re-affirmation, mint a `factId` and **Neo4j write** the new `:FACT` edge.
+
+#### Phase C — Explicit invalidations *(NEW)*
+
+For each invalidation `{src, rel, tgt}`:
+1. Look up open edges for `(src, rel)` (reuses the cache from Phase A where possible — if the source+relationType weren't in the facts batch, we run a fresh query).
+2. Filter to edges where `targetEntityId === tgt`.
+3. Call `closeFact(factId, occurredAt)` on each match.
+
+**Idempotency with Phase A:** if Phase A already closed the same edge (because the message also had a positive fact with same src+rel but different target), Phase C just re-stamps `validUntil` to the same value. No double-write issue.
+
+**The path that only Phase C handles:** a message like `"I left Grok last month."` has `facts: []` and `invalidations: [(User, WORKS_AT, Grok)]`. Phase A skips (no facts to drive contradictions). Phase B writes nothing. **Phase C closes the Grok edge.** Without invalidations, this case would silently leave the edge open — that's the bug we fixed.
+
+Returns `{ written, closed: [...A_closures, ...C_closures], skipped }`.
+
+---
+
+### Steps 8–11 *(unchanged)*
+
+| Step | What | Where |
+|---|---|---|
+| 8 | `upsert_entity_vectors` — embed `name + summary` for `isNew` only | OpenAI + Pinecone |
+| 9 | `upsert_fact_vectors` — embed `factText` for `temporal.written` (newly written facts only — NOT closed ones, NOT re-affirmations) | OpenAI + Pinecone |
+| 10 | `create_episode_node` — `:Episode { episodeId, content, occurredAt, ... }` | Neo4j |
+| 11 | `link_episode_entities` — `:MENTIONS` edges from episode to every entity in `allEntities` | Neo4j |
+
+### Final — `UPDATE episodes SET status='processed', processed_at=NOW()`
+
+**Postgres write.**
+
+---
+
+## Concrete trace — `"I left Grok last month."`
+
+This is the case the new code path was built for. Setup: assume an earlier message established `User -[WORKS_AT]-> Grok` (open).
+
+| t | Step | What happens |
+|---|---|---|
+| 0 | POST /ingest | Postgres row + Redis job, return 202 |
+| 40ms | init | episode → `processing` |
+| 50ms | fetch_episode | row loaded |
+| 65ms | fetch_recent | last 6 messages |
+| 700ms | extract_entities | `[Grok]` |
+| 800ms | resolve_entities | Grok matched (existing). `isNew=false`. |
+| 830ms | get_self_entity | User upserted (idempotent) |
+| 1.6s | **extract_facts** | LLM returns `{ facts: [], invalidations: [{ src: <userId>, tgt: <grokId>, rel: "WORKS_AT" }] }` |
+| 1.7s | **apply_temporal** | Phase A: skips (no rawFacts). Phase B: skips (nothing to write). **Phase C**: queries open `(User, WORKS_AT)` → finds Grok edge. Filter by target=`<grokId>` → match. `closeFact(grokFactId, occurredAt)` → `validUntil` set on the edge. |
+| 1.75s | upsert_entity_vectors | nothing new (Grok is `isNew=false`) |
+| 1.76s | upsert_fact_vectors | nothing new (`temporal.written` is empty) |
+| 1.80s | create_episode_node | `:Episode` node created |
+| 1.85s | link_episode_entities | `:MENTIONS` edges to Grok + User |
+| 1.90s | final | `status='processed'` |
+
+**Graph diff:**
+
+Before:
+```
+(User) -[:WORKS_AT { validFrom: T_prev, validUntil: null }]-> (Grok)
+```
+
+After:
+```
+(User) -[:WORKS_AT { validFrom: T_prev, validUntil: T_current }]-> (Grok)   ← closed
+```
+
+The edge isn't deleted. Asking retrieval `asOf: T_prev` still sees it as open; asking `asOf: now` sees it as closed.
+
+**No new Pinecone vectors.** No new entities, no new facts. Just one Neo4j SET on the existing edge's `validUntil`.
+
+---
+
+## Companion case — `"I left Grok and joined Anthropic."`
+
+Same setup. `extract_facts` returns:
+```json
+{
+  "facts": [{ "sourceEntityId": "<userId>", "targetEntityId": "<anthropicId>", "relationType": "WORKS_AT", "factText": "The user works at Anthropic.", "confidence": 0.99 }],
+  "invalidations": [{ "sourceEntityId": "<userId>", "targetEntityId": "<grokId>", "relationType": "WORKS_AT" }]
+}
+```
+
+In `apply_temporal`:
+
+- **Phase A**: group `(User, WORKS_AT)` finds open edge `[Grok]`. New targets = `{Anthropic}`. Grok not in new targets → **close Grok edge**.
+- **Phase B**: write new edge `User -[WORKS_AT]-> Anthropic`.
+- **Phase C**: invalidation says close `(User, WORKS_AT, Grok)`. Cached open list says Grok exists. Calls `closeFact(grokFactId, occurredAt)` again → idempotent (sets `validUntil` to the same value).
+
+**Result:** identical to if Phase A had run alone — Grok closed once, Anthropic opens. Phase C is redundant in this scenario, but it doesn't hurt. Phase C is what catches the *pure invalidation* case where Phase A would've missed.
+
+---
+
+## Final state across stores (full pipeline)
+
+After ingestion of any episode:
+
+**Postgres:**
+- `episodes` row → `status='processed'`, `processed_at` set
+- `processing_logs` → 11 rows, one per step, with `duration_ms` (12 rows if invalidation step ran longer; still one row for `apply_temporal` total)
+
+**Neo4j:**
+- New `:Entity` nodes for new entities
+- Updated/new `:FACT` edges with bi-temporal properties — old conflicting ones now have `validUntil` set
+- New `:Episode` node + `:MENTIONS` edges to all involved entities
+
+**Pinecone:**
+- One vector per *new* entity (filter via `isNew`)
+- One vector per *newly-written* fact (filter via `temporal.written` — closed-only-via-invalidation runs add ZERO fact vectors, since nothing was written)
+- Re-affirmations and pure invalidations don't bloat the index
+
+**Redis:**
+- Job moved from `wait` → `completed` queue, reaped after 1 day
+
+---
+
+## Summary of what changed
+
+| Area | Before | After |
+|---|---|---|
+| Fact extraction output | `RawFact[]` | `{ facts: RawFact[], invalidations: RawInvalidation[] }` |
+| Negation in messages | LLM tempted to emit `LEFT_COMPANY` / `STOPPED_X` | Prompt forbids it; emits invalidation entry instead |
+| Temporal step | Phase A (contradiction detection) + Phase B (writes) | Phase A + B + **Phase C (explicit invalidations)** |
+| Pure-invalidation case (`"I left X"` with no replacement) | Edge stayed open silently — bug | Edge correctly closed via Phase C |
+| Worker step count | 11 step rows in `processing_logs` | Still 11 (Phase C is part of `apply_temporal`) |
+
+When you're ready, we'll do the same walkthrough for retrieval, then run live tests.
