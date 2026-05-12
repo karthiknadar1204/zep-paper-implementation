@@ -21,6 +21,7 @@ import {
 } from "../services/resolver.service";
 import { applyTemporalFacts } from "../services/temporal.service";
 import {
+  markFactVectorsClosed,
   upsertEntityVectors,
   upsertFactVectors,
 } from "../services/pinecone.service";
@@ -166,6 +167,7 @@ async function processEpisode(job: Job<IngestionJobData>) {
       factsResult.invalidations,
       episodeId,
       occurredAtIso,
+      { current: currentMsg, recent },
     ),
   );
   console.log(
@@ -178,8 +180,15 @@ async function processEpisode(job: Job<IngestionJobData>) {
   const factVecCount = await step(episodeId, "upsert_fact_vectors", () =>
     upsertFactVectors(episode.userId, temporal.written),
   );
+  // Mirror Neo4j closures onto Pinecone metadata so isOpen / validUntilMs stay
+  // truthful. Metadata-only update, no re-embedding. Fail-soft inside the helper.
+  const closedVecCount = await step(
+    episodeId,
+    "update_closed_fact_vectors",
+    () => markFactVectorsClosed(temporal.closed),
+  );
   console.log(
-    `${t} pinecone: ${entVecCount} entity vector(s), ${factVecCount} fact vector(s) upserted`,
+    `${t} pinecone: ${entVecCount} entity vector(s), ${factVecCount} fact vector(s) upserted, ${closedVecCount} closed`,
   );
 
   await step(episodeId, "create_episode_node", () =>

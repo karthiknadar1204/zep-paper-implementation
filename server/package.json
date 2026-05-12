@@ -11,7 +11,9 @@
     "test:temporal": "bun run scripts/test-temporal.ts",
     "test:pinecone": "bun run scripts/test-pinecone.ts",
     "verify": "bun run scripts/verify-pipeline.ts",
-    "test:retrieval": "bun run scripts/test-retrieval.ts"
+    "test:retrieval": "bun run scripts/test-retrieval.ts",
+    "test:tier2": "bun run scripts/test-tier2.ts",
+    "scenario": "bun run scripts/scenario-e2e.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",

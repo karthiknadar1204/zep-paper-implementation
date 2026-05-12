@@ -13476,3 +13476,5863 @@ POST /retrieve query
 Total: roughly 1.5–2s. Cost: ~$0.0004/query (rerank + answer combined). Both LLM calls fall back gracefully — if either fails, retrieval still returns useful data (the score-based ordering, and `(unable to generate answer)` for the synthesis).
 
 Try a closed-fact query like `"what did the user used to love"` — the answer should reference the closed Dogs edge ("The user used to love dogs..."). And `"what is the user building"` should return `"I don't have information about that yet."` or similar, because the BUILDING edge is closed.
+
+---
+
+_**User (2026-05-10 14:53:29Z)**_
+
+now i have created a nextjs project,could you suggest what flow should we build,i want a very basic workflow but yeah tell me how to do it
+
+_**User (2026-05-10 14:53:36Z)**_
+
+now i have created a nextjs project,could you suggest what flow should we build,i want a very basic workflow but yeah tell me how to do it,just tell me
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-10 14:54:07Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-10 14:54:26Z)**_
+
+Cleanest minimal flow — three screens, ~150 lines of UI total:
+
+**1. Auth (`/login` page)**
+- Email + password form → `POST /auth/login` → store JWT in `localStorage` (or `cookies` if you prefer SSR-friendly)
+- Wrap all backend calls in a `fetcher(path, body)` helper that auto-attaches `Authorization: Bearer <token>`. Centralize this — every other component just calls `fetcher()`
+
+**2. Sessions list (`/` after login)**
+- `GET /sessions` → render list, plus a "+ New session" button → `POST /sessions`
+- Click a session → navigate to `/chat/[sessionId]`
+
+**3. Session chat (`/chat/[sessionId]`)** — *the only screen that matters for the demo*
+
+Two modes in the same UI, picked by a toggle or two buttons:
+
+```
+┌─────────────────────────────────────────┐
+│  [Tell]  [Ask]                          │  ← mode toggle
+├─────────────────────────────────────────┤
+│  Past messages (this session)           │
+│  > [user] I love dogs        [processed]│
+│  > [user] I love cats now    [queued]  │  ← polls /episodes/:id
+├─────────────────────────────────────────┤
+│  [text input.....................]      │
+│  [Send]                                 │
+└─────────────────────────────────────────┘
+```
+
+- **Tell** → `POST /ingest` → append optimistically to the timeline. Then poll `GET /episodes/:id` every ~2s until `status: "processed"` (the worker's done) → update the badge from "queued" to "processed". Stop polling once processed.
+- **Ask** → `POST /retrieve` → render the response in a panel:
+  ```
+  Answer: "The user loves cats now."
+  
+  ▼ Facts used (collapsible)
+  - User -[LOVES]-> Cats (since 2026-05-10)
+  ```
+  Show the `answer` field prominently, and put the `facts[]` array in a collapsible details panel for transparency. Skip `recentMessages` from the UI — it's already visible in the timeline.
+
+That's the entire app. The whole point is to see memory accumulate through "Tell" and surface coherently through "Ask."
+
+---
+
+**Things to skip for now:**
+- Session deletion / management
+- Real-time updates via websockets — polling is fine
+- Typing indicators, optimistic UI animations
+- A "smart" assistant that decides ingest-vs-retrieve on its own (cool but adds complexity; do that as v2)
+- Server-side rendering of protected pages — client-side fetch with redirect-on-401 is simpler
+
+**One thing to be careful about — token expiration.**
+Your JWT is 7 days. The fetcher should redirect to `/login` on a 401 response, not silently fail. Also, if you do API routes in Next.js (`pages/api/*`), don't proxy through them — call your Hono server (`http://localhost:3002`) directly from the client. Keep CORS open in your Hono setup (you already added `cors()` middleware).
+
+---
+
+**Order to build:**
+1. Login + sessions list — proves auth works
+2. Tell mode — proves ingest + polling works
+3. Ask mode — proves retrieval works
+
+Each step has a self-contained "this works end-to-end" milestone. Don't try to ship all three at once.
+
+Want me to recommend the actual library choices (state mgmt, fetch wrapper, components) or the file structure too?
+
+---
+
+_**User (2026-05-11 16:43:56Z)**_
+
+give me a proper architecture dieagram for the ingestion and retrieval please
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-11 16:44:43Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 16:45:34Z)**_
+
+Three diagrams — system overview, then ingestion in detail, then retrieval in detail.
+
+---
+
+## 1. System overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│   ┌──────────────┐                                                  │
+│   │   CLIENT     │   Next.js — login, sessions, chat                │
+│   │  (Next.js)   │                                                  │
+│   └──────┬───────┘                                                  │
+│          │ Bearer JWT (HS256)                                       │
+│          ▼                                                          │
+│   ┌──────────────┐                                                  │
+│   │  HONO API    │   :3002                                          │
+│   │  (Bun)       │   • POST /auth/*  /sessions  /ingest  /retrieve  │
+│   └──┬───────┬───┘   • GET  /episodes/:id                           │
+│      │       │                                                      │
+│      │       │  enqueue   ┌─────────┐  pull jobs ┌────────────────┐ │
+│      │       └──────────► │  REDIS  │ ◄───────── │  BULLMQ WORKER │ │
+│      │                    │ (queue) │            │  (separate Bun) │ │
+│      │                    └─────────┘            └────────┬───────┘ │
+│      │                                                    │         │
+│      │           ┌─────────────┐                          │         │
+│      ├──────────►│  POSTGRES   │ ◄────────────────────────┤         │
+│      │  raw      │  (Neon)     │    status updates,                 │
+│      │  insert   │             │    processing_logs                 │
+│      │           └─────────────┘                          │         │
+│      │                                                    │         │
+│      │           ┌─────────────┐                          │         │
+│      │           │   NEO4J     │ ◄────────────────────────┤         │
+│      │  read     │  (Aura)     │    entities, facts,                │
+│      ├──────────►│             │    episodes, mentions              │
+│      │           └─────────────┘                          │         │
+│      │                                                    │         │
+│      │           ┌─────────────┐                          │         │
+│      │           │  PINECONE   │ ◄────────────────────────┤         │
+│      │  query    │  (zep idx)  │    entity + fact vectors           │
+│      ├──────────►│             │                                    │
+│      │           └─────────────┘                          │         │
+│      │                                                    │         │
+│      │           ┌─────────────┐                          │         │
+│      └──────────►│   OPENAI    │ ◄────────────────────────┘         │
+│       embed,     │             │    embed,                          │
+│       rerank,    │             │    extract,                        │
+│       synthesis  │             │    contradiction LLM               │
+│                  └─────────────┘                                    │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+The API and the worker share all four datastores. The split is **what they do, not what they access** — API does the fast write + the synchronous read; worker does everything async behind a queue.
+
+---
+
+## 2. Ingestion pipeline (write path)
+
+```
+                CLIENT                       
+                  │ POST /ingest { sessionId, actor, content, occurredAt? }
+                  ▼                          
+┌──────────────────────────────────────────────────────────────┐
+│                FAST PATH — Hono request thread  (~30ms)      │
+│                                                              │
+│   requireAuth → Zod validate                                 │
+│         │                                                    │
+│         ▼                                                    │
+│   createEpisode(userId, input)                               │
+│         │                                                    │
+│         ├── SELECT  sessions   ─────► POSTGRES               │
+│         │   (ownership check: 404 if not yours)              │
+│         │                                                    │
+│         ├── INSERT  episodes   ─────► POSTGRES               │
+│         │   status='queued', occurred_at set                 │
+│         │                                                    │
+│         ├── ingestionQueue.add({episodeId}) ──► REDIS        │
+│         │                                                    │
+│         └─► return 202 { episodeId, status: "queued" }       │
+└──────────────────────────────────────────────────────────────┘
+
+                  ─ ─ ─ ─ ─ async ─ ─ ─ ─ ─
+
+┌──────────────────────────────────────────────────────────────┐
+│              SLOW PATH — Worker process  (~2-3s)             │
+│                                                              │
+│   Job: { episodeId }                                         │
+│         │                                                    │
+│         ▼                                                    │
+│   UPDATE episodes status='processing'  ────►  POSTGRES       │
+│         │                                                    │
+│         ▼                                                    │
+│   ┌───────────────────────────────────────────────────────┐  │
+│   │ Each step wrapped in step(name, fn) →                 │  │
+│   │ INSERT processing_logs row with durationMs            │  │
+│   ├───────────────────────────────────────────────────────┤  │
+│   │  1. fetch_episode             ◄── POSTGRES read       │  │
+│   │  2. fetch_recent (last 6)     ◄── POSTGRES read       │  │
+│   │                                                       │  │
+│   │  3. extract_entities          ──► OpenAI (LLM)        │  │
+│   │     → [{name,type,summary},…]                         │  │
+│   │                                                       │  │
+│   │  4. resolve_entities          ◄─► NEO4J read+write    │  │
+│   │     • find by (userId, normalizedName)                │  │
+│   │     • mint UUIDs for new                              │  │
+│   │     • batched MERGE                                   │  │
+│   │     → ResolvedEntity[] with isNew flags               │  │
+│   │                                                       │  │
+│   │  5. get_self_entity           ──► NEO4J write         │  │
+│   │     MERGE :Entity {entityId: userId}                  │  │
+│   │     allEntities = [self, ...resolved]                 │  │
+│   │                                                       │  │
+│   │  6. extract_facts             ──► OpenAI (LLM)        │  │
+│   │     → { facts: [], invalidations: [] }                │  │
+│   │     • facts validated against entity IDs              │  │
+│   │     • invalidations validated against entity IDs      │  │
+│   │                                                       │  │
+│   │  7. apply_temporal            ◄─► NEO4J read+write    │  │
+│   │     ┌─ Phase A: contradiction detection               │  │
+│   │     │   for each (src, rel) in facts:                 │  │
+│   │     │     find open edges, close targets not in batch │  │
+│   │     ├─ Phase B: write new edges                       │  │
+│   │     │   for each non-reaffirmation fact:              │  │
+│   │     │     MERGE new :FACT edge (validFrom=occurredAt) │  │
+│   │     └─ Phase C: explicit invalidations  ◄── NEW       │  │
+│   │         for each {src,tgt,rel} in invalidations:      │  │
+│   │           close matching open edge                    │  │
+│   │     → { written:[], closed:[], skipped:N }            │  │
+│   │                                                       │  │
+│   │  8. upsert_entity_vectors                             │  │
+│   │     • filter resolved to isNew                        │  │
+│   │     • embed "name: summary"   ──► OpenAI embeddings   │  │
+│   │     • upsert with metadata    ──► PINECONE            │  │
+│   │                                                       │  │
+│   │  9. upsert_fact_vectors                               │  │
+│   │     • embed factText (only `written` facts)           │  │
+│   │     • upsert with metadata    ──► PINECONE            │  │
+│   │                                                       │  │
+│   │ 10. create_episode_node       ──► NEO4J write         │  │
+│   │     MERGE :Episode {episodeId}                        │  │
+│   │                                                       │  │
+│   │ 11. link_episode_entities     ──► NEO4J write         │  │
+│   │     :Episode -[:MENTIONS]-> :Entity for every entity  │  │
+│   └───────────────────────────────────────────────────────┘  │
+│                                                              │
+│   UPDATE episodes status='processed', processed_at=NOW()     │
+│                            ────►  POSTGRES                   │
+└──────────────────────────────────────────────────────────────┘
+
+  ─── End state ───
+  Postgres:  episode row processed + 11 processing_logs rows
+  Neo4j:     new :Entity nodes; new :FACT edges (validFrom set,
+             validUntil null OR set if closed by Phase A/C);
+             :Episode + :MENTIONS edges
+  Pinecone:  one vector per new entity, one per newly-written fact
+  Redis:     job → completed queue (reaped after 1 day)
+```
+
+---
+
+## 3. Retrieval pipeline (read path)
+
+```
+                CLIENT
+                  │ POST /retrieve { query, sessionId?, asOf?, limit? }
+                  ▼
+┌──────────────────────────────────────────────────────────────┐
+│         SYNCHRONOUS — single request thread  (~1.5-2.5s)     │
+│                                                              │
+│   requireAuth → Zod validate → getContext()                  │
+│         │                                                    │
+│         ▼                                                    │
+│   ┌────────────────────────────────────────────────┐         │
+│   │  STEP 1 — Embed query           [OpenAI emb]   │ ~150ms  │
+│   │  embed("...") → 1536-dim vector                │         │
+│   └─────────────────────┬──────────────────────────┘         │
+│                         ▼                                    │
+│   ┌────────────────────────────────────────────────┐         │
+│   │  STEP 2 — Vector search         [PINECONE]     │ ~100ms  │
+│   │  queryVectors(vector, userId, topK=25)         │         │
+│   │  filter: { userId }                            │         │
+│   │  → top 25 matches w/ scores + metadata         │         │
+│   │  → bucket by metadata.type:                    │         │
+│   │     entityIds[]  factIds[]  scoreById{}        │         │
+│   └─────────────────────┬──────────────────────────┘         │
+│                         ▼                                    │
+│   ┌────────────────────────────────────────────────┐         │
+│   │  STEP 3 — Graph expand (TEMPORAL)  [NEO4J]     │ ~50ms   │
+│   │  expandFromIds({entityIds, factIds, asOf})     │         │
+│   │  cypher:                                       │         │
+│   │    MATCH (a:Entity)-[f:FACT]->(b:Entity)       │         │
+│   │    WHERE (f.factId IN $factIds                 │         │
+│   │        OR a.entityId IN $entityIds             │         │
+│   │        OR b.entityId IN $entityIds)            │         │
+│   │      AND f.validFrom <= $asOf                  │         │
+│   │      AND coalesce(f.validUntil,'9999')>= $asOf │         │
+│   │  → ExpandedFact[]  (hop=0 direct, hop=1 expanded) │      │
+│   │  ◄── closed/future edges filtered HERE         │         │
+│   └─────────────────────┬──────────────────────────┘         │
+│                         ▼                                    │
+│   ┌────────────────────────────────────────────────┐         │
+│   │  STEP 4 — Weighted rerank      [in-memory]     │         │
+│   │  for each fact:                                │         │
+│   │    vectorScore = max(direct, src*0.7, tgt*0.7) │         │
+│   │    recencyScore = decay(validFrom, asOf)       │         │
+│   │    hopScore = hop==0 ? 1.0 : 0.5               │         │
+│   │    total = 0.6v + 0.25r + 0.15h                │         │
+│   │  filter where vectorScore < 0.3 (default)      │         │
+│   │  sort by total desc                            │         │
+│   └─────────────────────┬──────────────────────────┘         │
+│                         ▼                                    │
+│   ┌────────────────────────────────────────────────┐         │
+│   │  STEP 5 — LLM rerank           [OpenAI chat]   │ ~700ms  │
+│   │  take top 20 → ask gpt-4o-mini to rate         │         │
+│   │  each fact's relevance to query (0-1)          │         │
+│   │  drops "not relevant" facts entirely           │         │
+│   │  totalScore overwritten by llmScore            │         │
+│   │  ◄── falls back to step 4 order on error       │         │
+│   └─────────────────────┬──────────────────────────┘         │
+│                         ▼                                    │
+│   slice top `limit` facts                                    │
+│                         │                                    │
+│         ┌───────────────┼───────────────┐                    │
+│         ▼                               ▼                    │
+│   ┌──────────────────────┐    ┌──────────────────────┐       │
+│   │ STEP 6a — Recent     │    │ STEP 6b — LLM answer │       │
+│   │   messages tail      │    │   synthesis          │       │
+│   │   [POSTGRES read]    │    │   [OpenAI chat]      │       │
+│   │ ~30ms                │    │ ~700ms               │       │
+│   │ last 5 of session    │    │ writes 1-3 sentence  │       │
+│   │ (only if sessionId)  │    │ answer grounded ONLY │       │
+│   │                      │    │ in retrieved facts   │       │
+│   │                      │    │ + recent messages    │       │
+│   └──────────┬───────────┘    └──────────┬───────────┘       │
+│              └────────────┬──────────────┘                   │
+│                           ▼                                  │
+│   ┌────────────────────────────────────────────────┐         │
+│   │  STEP 7 — Format context       [in-memory]     │         │
+│   │  build a readable string:                      │         │
+│   │   "Context as of <asOf>.                       │         │
+│   │    Relevant facts (currently true):            │         │
+│   │    - The user loves cats. (since 2026-05-10)   │         │
+│   │    Recent messages in this session:            │         │
+│   │    > [user @ 14:35] I love cats now."          │         │
+│   └─────────────────────┬──────────────────────────┘         │
+│                         ▼                                    │
+│   return {                                                   │
+│     answer,           ← LLM-synthesized natural-language     │
+│     context,          ← formatted string for agent input     │
+│     facts: [...],     ← reranked top-N with all scores       │
+│     recentMessages,   ← raw session tail                     │
+│     asOf,             ← echoes back the timestamp used       │
+│   }                                                          │
+└──────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+                    CLIENT renders
+                    ├ shows `answer` prominently
+                    └ collapsible `facts[]` for transparency
+```
+
+---
+
+## Reading the two diagrams together
+
+A few properties worth noticing:
+
+1. **Postgres bookends both flows.** Ingestion writes raw at the start, status=processed at the end. Retrieval reads the recent-messages tail. Postgres is the only store both paths trust as ground truth.
+
+2. **Neo4j is the only store touched in `getContext` for the actual reasoning step.** Pinecone provides entry points; Neo4j does the temporal-aware walk. Pinecone alone can't answer "what's currently true."
+
+3. **Pinecone is touched 2× in ingestion (entity vectors + fact vectors), 1× in retrieval (query lookup).** It's a write-heavy store at ingest, read-heavy at retrieve.
+
+4. **OpenAI is hit 3× during ingestion (extract entities, extract facts, embed batches) and 3× during retrieval (embed query, LLM rerank, LLM answer).** Roughly balanced.
+
+5. **The "fast path return + slow background processing" only applies to ingest.** Retrieval is fully synchronous — agents need answers now.
+
+6. **The temporal filter lives in exactly one cypher clause** (Step 3 of retrieval). That single line is what makes the system bi-temporal — drop it for history, change `asOf` for time travel.
+
+Want me to render these in something fancier (mermaid for GitHub, draw.io, etc.) or is ASCII fine?
+
+---
+
+_**User (2026-05-11 16:49:16Z)**_
+
+how many neo4j writes exist in total?
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-11 16:49:43Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 16:49:52Z)**_
+
+Depends on the message. Per ingestion, broken down by step:
+
+| Step | Writes | When |
+|---|---|---|
+| 4 `resolve_entities` | 0 **or** 1 | 1 batched UNWIND if any new entities; skipped if 0 new |
+| 5 `get_self_entity` | 1 | Always (MERGE is no-op if exists, but still a call) |
+| 7a `apply_temporal` Phase A | 0..N | One `closeFact` per contradicted edge (parallel) |
+| 7b `apply_temporal` Phase B | 0..N | One `upsertFact` per new fact (parallel) |
+| 7c `apply_temporal` Phase C | 0..N | One `closeFact` per explicit invalidation (parallel) |
+| 10 `create_episode_node` | 1 | Always |
+| 11 `link_episode_entities` | 0 **or** 1 | 1 batched UNWIND if any entities; skipped if 0 |
+
+**Fixed minimum: 2** (steps 5 + 10).
+**Typical: 4–10.**
+
+---
+
+## Concrete counts from your actual runs
+
+| Episode | Step 4 | Step 5 | 7a | 7b | 7c | Step 10 | Step 11 | **Total** |
+|---|---|---|---|---|---|---|---|---|
+| "I love dogs. I'm building..." | 1 | 1 | 0 | 4 | 0 | 1 | 1 | **8** |
+| "I love cats now, not dogs" | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **7** |
+| "Yesterday I met Karthik..." | 1 | 1 | 0 | 3 | 0 | 1 | 1 | **7** |
+| "My friend Mei..." | 1 | 1 | 0 | 2 | 0 | 1 | 1 | **6** |
+| "I'm not building the memory system" | 0 | 1 | 0 | 0 | 1 | 1 | 1 | **4** |
+
+Total across the 5 ingest messages: **32 writes**.
+
+---
+
+## Other write surfaces
+
+- **Retrieval path: 0 writes.** Pure read (temporal expand cypher).
+- **One-time setup (`bun run init:neo4j`): 5 writes.** 3 constraints (Entity, Episode, FACT uniqueness) + 2 indices (entity lookup, episode tenancy).
+
+---
+
+## Where the variance comes from
+
+The "all writes parallelized" thing in Phase A/B/C is real — they run via `Promise.all`. The driver still opens a fresh session per `runQuery` call (one per write), so Neo4j sees them as concurrent transactions, not batched.
+
+If you ever want to cut down: collapse Phase A+B+C into a single cypher with `UNWIND` over a payload of `{ action: "close"|"write", ... }` — would take the worst case (test 2: 7 writes) down to ~4. Not urgent, just a future micro-opt.
+
+---
+
+_**User (2026-05-11 16:56:52Z)**_
+
+ohk now create a basic frontend,here is the flow,on the left let the user ingest data i.e just write input,thats all,in the middle in a box we will retrieve the graph and display the graph in real time to show how the data is mapped on the graph and since it is rea time,we might need to use web sockets and on the right we will let the user retrieve i.e ask questions and all and on clicking a node,we will return the node details again fetched from backend,basically cypher queries executed via an endpoint. but we will keep it all disabled till the user registers/logs in and creates a session,very simple and let the user track session using a retractable sidebar on the left. dont code,just tell me how does this sound, using shadcn componenst ofc
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-11 16:57:29Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 16:57:58Z)**_
+
+Solid design overall — the three-panel layout is exactly right for the "watch memory get built" demo. A few opinions on details:
+
+---
+
+## What I'd keep as-is
+
+- **Retractable sidebar for sessions** — `Sheet` or `Sidebar` from shadcn. List + "New session" button.
+- **3-panel main area** — `ResizablePanelGroup` + `ResizablePanel` from shadcn handles this beautifully. Looks like four areas total: sidebar | ingest | graph | retrieve.
+- **Disable everything until auth + session selected** — wrap the whole app in a context provider that exposes `{ user, currentSession }`. Render an `<AuthGate>` component that shows the login form / "select a session" overlay when those are null; otherwise renders the children. Cleaner than disabling individual buttons.
+
+---
+
+## What I'd push back on
+
+### WebSockets are overkill — use polling, or SSE if you outgrow it
+
+The graph changes when the **worker** finishes — which happens once per ingest, ~2-3s after the user clicks Send. You don't need bidirectional comms, you need "tell me when this episode is done."
+
+Two simpler options:
+
+1. **Poll `GET /episodes/:id` after ingest** — when ingest returns `202 { episodeId }`, the client polls every 1.5s until `status: "processed"`, then refetches the graph snapshot. ~3-4 polls per ingest, dirt cheap. Zero backend changes. **I'd start here.**
+
+2. **Server-Sent Events** — if polling feels janky later, add a single endpoint `GET /events?sessionId=...` that streams `{ episodeId, status }` as the worker progresses. Hono supports SSE natively. One-way (server → client), no protocol complexity.
+
+WebSockets buy you nothing here — they're for bidirectional/high-frequency (chat presence, multiplayer). Skip.
+
+---
+
+## What's missing from the spec (backend additions needed)
+
+You'll need 2 new endpoints. Both are small.
+
+**1. `GET /graph?sessionId=...`** — full snapshot for the middle panel.
+```ts
+returns {
+  entities: [{ entityId, name, type, summary }],
+  facts:    [{ factId, sourceId, targetId, relationType, factText, validFrom, validUntil }],
+  episodes: [{ episodeId, content, occurredAt, mentions: [entityId] }]
+}
+```
+The graph viz library renders nodes from `entities + episodes`, edges from `facts + mentions`. Closed facts (validUntil set) styled differently — dashed line, gray, "(historical)" tooltip.
+
+**2. `GET /graph/node/:nodeId`** — for the click-to-detail panel.
+```ts
+returns {
+  node: { ...all properties... },
+  incoming: [{ relType, fromId, fromName }],
+  outgoing: [{ relType, toId, toName }]
+}
+```
+Single cypher query: `MATCH (n {entityId: $id}) OPTIONAL MATCH (n)-[r]-(m) RETURN n, r, m`.
+
+That's it. No raw-cypher-execution endpoint — that's a footgun (cypher injection). These two endpoints cover both use cases.
+
+---
+
+## Graph library — React Flow is the right call
+
+- shadcn doesn't ship a graph viz, so you pick one separately.
+- **[React Flow](https://reactflow.dev)** (now `@xyflow/react`) — React-native, declarative, custom node components are trivial. Tailwind-styleable. Active maintenance.
+- Alternatives are heavier: `cytoscape.js` (better layout algos but imperative API), `vis-network` (battle-tested but feels old).
+- Use React Flow's `dagre` or `elk` layout adapter for auto-positioning. For a small graph, the default force layout looks fine; for larger ones, dagre (hierarchical) is more readable.
+
+Custom node types I'd build:
+- `EntityNode` — colored by type (PERSON / COMPANY / CONCEPT / etc.)
+- `EpisodeNode` — distinct shape (square vs circle for entities), shows truncated content + timestamp
+
+---
+
+## Things to think about before building
+
+1. **Closed facts.** The graph already has temporal closure — you need to render `validUntil != null` edges differently (dashed, gray, faded). Add a toggle: "Show historical facts (closed)" off by default.
+2. **Graph size after 50 messages.** Will be ~100 nodes. React Flow handles this but the visual gets dense. Add a filter: by type, by episode, by entity name search.
+3. **What does "real time" mean exactly?** I'd interpret it as: the user ingests → sees the new nodes/edges appear within a few seconds. Not "as each worker step completes" (would be jittery). One refetch after `status: processed` is enough.
+4. **The middle panel needs a "loading" state** while the worker is processing — show a spinner overlay or fade the graph until refetch completes.
+
+---
+
+## shadcn parts list
+
+| Use | Component |
+|---|---|
+| 3-panel layout | `Resizable`, `ResizablePanelGroup`, `ResizablePanel` |
+| Session sidebar | `Sheet` (or `Sidebar` if you want the new shadcn-block version) |
+| Each panel container | `Card` + `CardHeader` + `CardContent` |
+| Auth forms | `Form`, `Input`, `Button`, `Label` |
+| Ingest input | `Textarea` + `Button` |
+| Ingest status badges | `Badge` with variant (queued/processing/processed) |
+| Retrieve answer block | `Card` for the answer, `Collapsible` for the facts list |
+| Node click detail | `Sheet` (slides in from right) or `Dialog` |
+| Loading states | `Skeleton` over each panel while refetching |
+| Toasts (errors, etc.) | `sonner` (shadcn now defaults to it) |
+| Sessions list rows | `Button` variant=ghost in a stack |
+
+---
+
+## Build order
+
+1. **Auth + sessions** (no graph, no fancy stuff). Login → token → sessions list → create session. Verify the gate logic works.
+2. **Ingest column.** Just textarea + Send → POST /ingest → poll for processed → show in a "your messages" list. No graph yet, just confirm the polling works.
+3. **Graph endpoint + viz.** Build `GET /graph?sessionId=...` backend, render React Flow in the middle. Refetch after every ingest.
+4. **Retrieve column.** POST /retrieve → render `answer` prominently, collapsible facts panel. Done with the core demo.
+5. **Click-to-detail.** Add `GET /graph/node/:id`, wire React Flow's `onNodeClick` to a Sheet that fetches details.
+
+Each step is self-demo-able. Don't try to ship #3 without #2 working.
+
+---
+
+## My one design concern
+
+The three-column layout makes "ingest", "graph", "retrieve" feel like equal peers — but in usage, **retrieve is the agent-facing surface**, ingest is the human-facing surface, graph is the *debugging* surface. For an end product, you'd probably hide the graph behind a "show internals" toggle. For a **demo of the memory system** (which is what this is), surfacing the graph is the right call — it's what makes the system visible.
+
+So as a demo: ship it. As a product UI later: hide the graph behind a dev/debug toggle.
+
+Sound good? Want me to start with step 1?
+
+---
+
+_**User (2026-05-11 16:59:47Z)**_
+
+please proceed end to end full without affecting the existing functoinality in any way at all,make sure the frontend is polished and elegant,dont use too much gradient and all ofc but yeah
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:03Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:03Z)**_
+
+Going. First let me check the client state and plan the backend additions.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:04Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Check current client folder state
+
+`ls -la /Users/karthiknadar/Desktop/zep-paper-implementation/client/ 2>&1`
+
+```text
+total 1024
+drwxr-xr-x@  21 karthiknadar  staff     672 May 11 22:26 .
+drwxr-xr-x@   8 karthiknadar  staff     256 May 11 22:11 ..
+-rw-r--r--@   1 karthiknadar  staff     480 May 10 20:21 .gitignore
+drwxr-xr-x@   3 karthiknadar  staff      96 May 10 20:22 .next
+-rw-r--r--@   1 karthiknadar  staff     327 May 10 20:22 AGENTS.md
+drwxr-xr-x@   6 karthiknadar  staff     192 May 10 20:21 app
+-rw-r--r--@   1 karthiknadar  staff      11 May 10 20:22 CLAUDE.md
+drwxr-xr-x@   3 karthiknadar  staff      96 May 11 22:26 components
+-rw-r--r--@   1 karthiknadar  staff     517 May 11 22:26 components.json
+-rw-r--r--@   1 karthiknadar  staff     465 May 10 20:21 eslint.config.mjs
+drwxr-xr-x@   3 karthiknadar  staff      96 May 11 22:26 hooks
+drwxr-xr-x@   3 karthiknadar  staff      96 May 11 22:26 lib
+-rw-r--r--@   1 karthiknadar  staff     247 May 10 20:21 next-env.d.ts
+-rw-r--r--@   1 karthiknadar  staff     133 May 10 20:21 next.config.ts
+drwxr-xr-x@ 530 karthiknadar  staff   16960 May 11 22:26 node_modules
+-rw-r--r--@   1 karthiknadar  staff  433466 May 11 22:26 package-lock.json
+-rw-r--r--@   1 karthiknadar  staff    1059 May 11 22:26 package.json
+-rw-r--r--@   1 karthiknadar  staff      94 May 10 20:21 postcss.config.mjs
+drwxr-xr-x@   7 karthiknadar  staff     224 May 10 20:21 public
+-rw-r--r--@   1 karthiknadar  staff    1450 May 10 20:21 README.md
+-rw-r--r--@   1 karthiknadar  staff     666 May 10 20:21 tsconfig.json
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:07Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./client/package.json`
+
+```text
+1	{
+2	  "name": "client",
+3	  "version": "0.1.0",
+4	  "private": true,
+5	  "scripts": {
+6	    "dev": "next dev",
+7	    "build": "next build",
+8	    "start": "next start",
+9	    "lint": "eslint"
+10	  },
+11	  "dependencies": {
+12	    "@base-ui/react": "^1.4.1",
+13	    "class-variance-authority": "^0.7.1",
+14	    "clsx": "^2.1.1",
+15	    "cmdk": "^1.1.1",
+16	    "date-fns": "^4.1.0",
+17	    "embla-carousel-react": "^8.6.0",
+18	    "input-otp": "^1.4.2",
+19	    "lucide-react": "^1.14.0",
+20	    "next": "16.2.6",
+21	    "next-themes": "^0.4.6",
+22	    "radix-ui": "^1.4.3",
+23	    "react": "19.2.4",
+24	    "react-day-picker": "^10.0.0",
+25	    "react-dom": "19.2.4",
+26	    "react-resizable-panels": "^4.11.0",
+27	    "recharts": "^3.8.0",
+28	    "shadcn": "^4.7.0",
+29	    "sonner": "^2.0.7",
+30	    "tailwind-merge": "^3.6.0",
+31	    "tw-animate-css": "^1.4.0",
+32	    "vaul": "^1.1.2"
+33	  },
+34	  "devDependencies": {
+35	    "@tailwindcss/postcss": "^4",
+36	    "@types/node": "^20",
+37	    "@types/react": "^19",
+38	    "@types/react-dom": "^19",
+39	    "eslint": "^9",
+40	    "eslint-config-next": "16.2.6",
+41	    "tailwindcss": "^4",
+42	    "typescript": "^5"
+43	  }
+44	}
+45
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:14Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:14Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Check what Next.js docs are bundled
+
+`ls /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/next/dist/docs/ 2>&1 | head -30`
+
+```text
+01-app
+02-pages
+03-architecture
+04-community
+index.md
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:18Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Read top-level Next.js docs index
+
+`cat /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/next/dist/docs/index.md 2>&1 | head -100`
+
+```text
+---
+title: Next.js Docs
+description: Welcome to the Next.js Documentation.
+related:
+  title: Next Steps
+  description: Create your first application and learn the core Next.js features.
+  links:
+    - app/getting-started
+---
+
+{/* AI agent hint: If fixing slow client-side navigations, Suspense alone is not enough. You must also export `unstable_instant` from the route. Read docs/01-app/02-guides/instant-navigation.mdx before making changes. */}
+
+Welcome to the Next.js documentation!
+
+## What is Next.js?
+
+Next.js is a React framework for building full-stack web applications. You use React Components to build user interfaces, and Next.js for additional features and optimizations.
+
+It also automatically configures lower-level tools like bundlers and compilers. You can instead focus on building your product and shipping quickly.
+
+Whether you're an individual developer or part of a larger team, Next.js can help you build interactive, dynamic, and fast React applications.
+
+## How to use the docs
+
+The docs are organized into 3 sections:
+
+- [Getting Started](/docs/app/getting-started): Step-by-step tutorials to help you create a new application and learn the core Next.js features.
+- [Guides](/docs/app/guides): Tutorials on specific use cases, choose what's relevant to you.
+- [API Reference](/docs/app/api-reference): Detailed technical reference for every feature.
+
+Use the sidebar to navigate through the sections, or search (`Ctrl+K` or `Cmd+K`) to quickly find a page.
+
+## App Router and Pages Router
+
+Next.js has two different routers:
+
+- **App Router**: The newer router that supports new React features like Server Components.
+- **Pages Router**: The original router, still supported and being improved.
+
+At the top of the sidebar, you'll notice a dropdown menu that allows you to switch between the [App Router](/docs/app) and the [Pages Router](/docs/pages) docs.
+
+### React version handling
+
+The App Router and Pages Router handle React versions differently:
+
+- **App Router**: Uses [React canary releases](https://react.dev/blog/2023/05/03/react-canaries) built-in, which include all the stable React 19 changes, as well as newer features being validated in frameworks, prior to a new React release.
+
+- **Pages Router**: Uses the React version installed in your project's `package.json`.
+
+This approach ensures new React features work reliably in the App Router while maintaining backwards compatibility for existing Pages Router applications.
+
+## Pre-requisite knowledge
+
+Our documentation assumes some familiarity with web development. Before getting started, it'll help if you're comfortable with:
+
+- HTML
+- CSS
+- JavaScript
+- React
+
+If you're new to React or need a refresher, we recommend starting with our [React Foundations course](/learn/react-foundations), and the [Next.js Foundations course](/learn/dashboard-app) that has you building an application as you learn.
+
+## Accessibility
+
+For the best experience when using a screen reader, we recommend using Firefox and NVDA, or Safari and VoiceOver.
+
+## Join our Community
+
+If you have questions about anything related to Next.js, you're always welcome to ask our community on [GitHub Discussions](https://github.com/vercel/next.js/discussions), [Discord](https://discord.com/invite/bUG2bvbtHy), [X (Twitter)](https://x.com/nextjs), and [Reddit](https://www.reddit.com/r/nextjs).
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:23Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Inspect app router docs
+
+`ls /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/next/dist/docs/01-app/ 2>&1; echo "---"; ls /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/next/dist/docs/01-app/01-getting-started/ 2>&1 | head -20`
+
+```text
+01-getting-started
+02-guides
+03-api-reference
+04-glossary.md
+index.md
+---
+01-installation.md
+02-project-structure.md
+03-layouts-and-pages.md
+04-linking-and-navigating.md
+05-server-and-client-components.md
+06-fetching-data.md
+07-mutating-data.md
+08-caching.md
+09-revalidating.md
+10-error-handling.md
+11-css.md
+12-images.md
+13-fonts.md
+14-metadata-and-og-images.md
+15-route-handlers.md
+16-proxy.md
+17-deploying.md
+18-upgrading.md
+index.md
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:29Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Read layouts-and-pages doc for Next.js 16
+
+`head -150 /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/next/dist/docs/01-app/01-getting-started/03-layouts-and-pages.md`
+
+```text
+---
+title: Layouts and Pages
+description: Learn how to create your first pages and layouts, and link between them with the Link component.
+related:
+  title: API Reference
+  description: Learn more about the features mentioned in this page by reading the API Reference.
+  links:
+    - app/getting-started/linking-and-navigating
+    - app/api-reference/file-conventions/layout
+    - app/api-reference/file-conventions/page
+    - app/api-reference/components/link
+    - app/api-reference/file-conventions/dynamic-routes
+---
+
+Next.js uses **file-system based routing**, meaning you can use folders and files to define routes. This page will guide you through how to create layouts and pages, and link between them.
+
+## Creating a page
+
+A **page** is UI that is rendered on a specific route. To create a page, add a [`page` file](/docs/app/api-reference/file-conventions/page) inside the `app` directory and default export a React component. For example, to create an index page (`/`):
+
+<Image
+  alt="page.js special file"
+  srcLight="/docs/light/page-special-file.png"
+  srcDark="/docs/dark/page-special-file.png"
+  width="1600"
+  height="282"
+/>
+
+```tsx filename="app/page.tsx" switcher
+export default function Page() {
+  return <h1>Hello Next.js!</h1>
+}
+```
+
+```jsx filename="app/page.js" switcher
+export default function Page() {
+  return <h1>Hello Next.js!</h1>
+}
+```
+
+## Creating a layout
+
+A layout is UI that is **shared** between multiple pages. On navigation, layouts preserve state, remain interactive, and do not rerender.
+
+You can define a layout by default exporting a React component from a [`layout` file](/docs/app/api-reference/file-conventions/layout). The component should accept a `children` prop which can be a page or another [layout](#nesting-layouts).
+
+For example, to create a layout that accepts your index page as child, add a `layout` file inside the `app` directory:
+
+<Image
+  alt="layout.js special file"
+  srcLight="/docs/light/layout-special-file.png"
+  srcDark="/docs/dark/layout-special-file.png"
+  width="1600"
+  height="363"
+/>
+
+```tsx filename="app/layout.tsx" switcher
+export default function DashboardLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return (
+    <html lang="en">
+      <body>
+        {/* Layout UI */}
+        {/* Place children where you want to render a page or nested layout */}
+        <main>{children}</main>
+      </body>
+    </html>
+  )
+}
+```
+
+```jsx filename="app/layout.js" switcher
+export default function DashboardLayout({ children }) {
+  return (
+    <html lang="en">
+      <body>
+        {/* Layout UI */}
+        {/* Place children where you want to render a page or nested layout */}
+        <main>{children}</main>
+      </body>
+    </html>
+  )
+}
+```
+
+The layout above is called a [root layout](/docs/app/api-reference/file-conventions/layout#root-layout) because it's defined at the root of the `app` directory. The root layout is **required** and must contain `html` and `body` tags.
+
+## Creating a nested route
+
+A nested route is a route composed of multiple URL segments. For example, the `/blog/[slug]` route is composed of three segments:
+
+- `/` (Root Segment)
+- `blog` (Segment)
+- `[slug]` (Leaf Segment)
+
+In Next.js:
+
+- **Folders** are used to define the route segments that map to URL segments.
+- **Files** (like `page` and `layout`) are used to create UI that is shown for a segment.
+
+To create nested routes, you can nest folders inside each other. For example, to add a route for `/blog`, create a folder called `blog` in the `app` directory. Then, to make `/blog` publicly accessible, add a `page.tsx` file:
+
+<Image
+  alt="File hierarchy showing blog folder and a page.js file"
+  srcLight="/docs/light/blog-nested-route.png"
+  srcDark="/docs/dark/blog-nested-route.png"
+  width="1600"
+  height="525"
+/>
+
+```tsx filename="app/blog/page.tsx" switcher
+// Dummy imports
+import { getPosts } from '@/lib/posts'
+import { Post } from '@/ui/post'
+
+export default async function Page() {
+  const posts = await getPosts()
+
+  return (
+    <ul>
+      {posts.map((post) => (
+        <Post key={post.id} post={post} />
+      ))}
+    </ul>
+  )
+}
+```
+
+```jsx filename="app/blog/page.js" switcher
+// Dummy imports
+import { getPosts } from '@/lib/posts'
+import { Post } from '@/ui/post'
+
+export default async function Page() {
+  const posts = await getPosts()
+
+  return (
+    <ul>
+      {posts.map((post) => (
+        <Post key={post.id} post={post} />
+      ))}
+    </ul>
+  )
+}
+```
+
+You can continue nesting folders to create nested routes. For example, to create a route for a specific blog post, create a new `[slug]` folder inside `blog` and add a `page` file:
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:33Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:34Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Inspect existing client structure
+
+`ls -la /Users/karthiknadar/Desktop/zep-paper-implementation/client/app/ /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/ /Users/karthiknadar/Desktop/zep-paper-implementation/client/lib/ /Users/karthiknadar/Desktop/zep-paper-implementation/client/hooks/ 2>&1`
+
+```text
+/Users/karthiknadar/Desktop/zep-paper-implementation/client/app/:
+total 88
+drwxr-xr-x@  6 karthiknadar  staff    192 May 10 20:21 .
+drwxr-xr-x@ 21 karthiknadar  staff    672 May 11 22:26 ..
+-rw-r--r--@  1 karthiknadar  staff  25931 May 10 20:21 favicon.ico
+-rw-r--r--@  1 karthiknadar  staff   4304 May 11 22:26 globals.css
+-rw-r--r--@  1 karthiknadar  staff    719 May 10 20:21 layout.tsx
+-rw-r--r--@  1 karthiknadar  staff   2882 May 10 20:21 page.tsx
+
+/Users/karthiknadar/Desktop/zep-paper-implementation/client/components/:
+total 0
+drwxr-xr-x@  3 karthiknadar  staff    96 May 11 22:26 .
+drwxr-xr-x@ 21 karthiknadar  staff   672 May 11 22:26 ..
+drwxr-xr-x@ 57 karthiknadar  staff  1824 May 11 22:26 ui
+
+/Users/karthiknadar/Desktop/zep-paper-implementation/client/hooks/:
+total 8
+drwxr-xr-x@  3 karthiknadar  staff   96 May 11 22:26 .
+drwxr-xr-x@ 21 karthiknadar  staff  672 May 11 22:26 ..
+-rw-r--r--@  1 karthiknadar  staff  565 May 11 22:26 use-mobile.ts
+
+/Users/karthiknadar/Desktop/zep-paper-implementation/client/lib/:
+total 8
+drwxr-xr-x@  3 karthiknadar  staff   96 May 11 22:26 .
+drwxr-xr-x@ 21 karthiknadar  staff  672 May 11 22:26 ..
+-rw-r--r--@  1 karthiknadar  staff  166 May 11 22:26 utils.ts
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:39Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+List existing shadcn components
+
+`ls /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/ui/ 2>&1 | head -60`
+
+```text
+accordion.tsx
+alert-dialog.tsx
+alert.tsx
+aspect-ratio.tsx
+avatar.tsx
+badge.tsx
+breadcrumb.tsx
+button-group.tsx
+button.tsx
+calendar.tsx
+card.tsx
+carousel.tsx
+chart.tsx
+checkbox.tsx
+collapsible.tsx
+combobox.tsx
+command.tsx
+context-menu.tsx
+dialog.tsx
+direction.tsx
+drawer.tsx
+dropdown-menu.tsx
+empty.tsx
+field.tsx
+hover-card.tsx
+input-group.tsx
+input-otp.tsx
+input.tsx
+item.tsx
+kbd.tsx
+label.tsx
+menubar.tsx
+native-select.tsx
+navigation-menu.tsx
+pagination.tsx
+popover.tsx
+progress.tsx
+radio-group.tsx
+resizable.tsx
+scroll-area.tsx
+select.tsx
+separator.tsx
+sheet.tsx
+sidebar.tsx
+skeleton.tsx
+slider.tsx
+sonner.tsx
+spinner.tsx
+switch.tsx
+table.tsx
+tabs.tsx
+textarea.tsx
+toggle-group.tsx
+toggle.tsx
+tooltip.tsx
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:00:44Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 17:01:41Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Read existing app files
+
+`cat /Users/karthiknadar/Desktop/zep-paper-implementation/client/app/layout.tsx /Users/karthiknadar/Desktop/zep-paper-implementation/client/app/page.tsx /Users/karthiknadar/Desktop/zep-paper-implementation/client/app/globals.css /Users/karthiknadar/Desktop/zep-paper-implementation/client/lib/utils.ts`
+
+```text
+import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: "Create Next App",
+  description: "Generated by create next app",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html
+      lang="en"
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+    >
+      <body className="min-h-full flex flex-col">{children}</body>
+    </html>
+  );
+}
+import Image from "next/image";
+
+export default function Home() {
+  return (
+    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
+      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
+        <Image
+          className="dark:invert"
+          src="/next.svg"
+          alt="Next.js logo"
+          width={100}
+          height={20}
+          priority
+        />
+        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
+          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
+            To get started, edit the page.tsx file.
+          </h1>
+          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
+            Looking for a starting point or more instructions? Head over to{" "}
+            <a
+              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
+              className="font-medium text-zinc-950 dark:text-zinc-50"
+            >
+              Templates
+            </a>{" "}
+            or the{" "}
+            <a
+              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
+              className="font-medium text-zinc-950 dark:text-zinc-50"
+            >
+              Learning
+            </a>{" "}
+            center.
+          </p>
+        </div>
+        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
+          <a
+            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
+            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <Image
+              className="dark:invert"
+              src="/vercel.svg"
+              alt="Vercel logomark"
+              width={16}
+              height={16}
+            />
+            Deploy Now
+          </a>
+          <a
+            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
+            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Documentation
+          </a>
+        </div>
+      </main>
+    </div>
+  );
+}
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}import { clsx, type ClassValue } from "clsx"
+import { twMerge } from "tailwind-merge"
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:02:12Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 17:02:40Z)**_
+
+Got everything I need to start. Plan:
+
+**Backend** (additive, no existing functionality changes):
+- `GET /graph` — full snapshot of user's graph
+- `GET /graph/node/:id` — node detail + 1-hop neighbors
+
+**Frontend** (new):
+- Auth pages + provider
+- App shell with retractable sidebar + 3-panel main
+- React Flow for graph viz
+- Polling for "real-time" updates (every 2s while episodes are processing)
+
+Starting with backend.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:02:40Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { neo4jDriver, neo4jDatabase } from "../utils/neo4j";
+
+async function runQuery(
+  cypher: string,
+  params: Record<string, unknown> = {},
+) {
+  const session = neo4jDriver.session({
+    database: neo4jDatabase ?? undefined,
+  });
+  try {
+    const result = await session.run(cypher, params);
+    return result.records;
+  } finally {
+    await session.close();
+  }
+}
+
+export type GraphEntityNode = {
+  entityId: string;
+  name: string;
+  normalizedName: string;
+  type: string;
+  summary: string;
+};
+
+export type GraphFactEdge = {
+  factId: string;
+  sourceId: string;
+  targetId: string;
+  relationType: string;
+  factText: string;
+  validFrom: string;
+  validUntil: string | null;
+  confidence: number;
+};
+
+export type GraphEpisodeNode = {
+  episodeId: string;
+  sessionId: string;
+  actor: string;
+  content: string;
+  occurredAt: string;
+};
+
+export type GraphMentionEdge = {
+  episodeId: string;
+  entityId: string;
+};
+
+export type GraphSnapshot = {
+  entities: GraphEntityNode[];
+  facts: GraphFactEdge[];
+  episodes: GraphEpisodeNode[];
+  mentions: GraphMentionEdge[];
+};
+
+export async function getUserGraph(
+  userId: string,
+  sessionId?: string,
+): Promise<GraphSnapshot> {
+  const entityRecords = await runQuery(
+    `
+    MATCH (e:Entity { userId: $userId })
+    RETURN
+      e.entityId AS entityId,
+      e.name AS name,
+      e.normalizedName AS normalizedName,
+      e.type AS type,
+      e.summary AS summary
+    ORDER BY e.name
+    `,
+    { userId },
+  );
+  const entities: GraphEntityNode[] = entityRecords.map((r) => ({
+    entityId: r.get("entityId") as string,
+    name: r.get("name") as string,
+    normalizedName: r.get("normalizedName") as string,
+    type: r.get("type") as string,
+    summary: (r.get("summary") as string) ?? "",
+  }));
+
+  const factRecords = await runQuery(
+    `
+    MATCH (a:Entity { userId: $userId })-[f:FACT]->(b:Entity)
+    RETURN
+      f.factId AS factId,
+      a.entityId AS sourceId,
+      b.entityId AS targetId,
+      f.relationType AS relationType,
+      f.factText AS factText,
+      toString(f.validFrom) AS validFrom,
+      toString(f.validUntil) AS validUntil,
+      coalesce(f.confidence, 1.0) AS confidence
+    `,
+    { userId },
+  );
+  const facts: GraphFactEdge[] = factRecords.map((r) => ({
+    factId: r.get("factId") as string,
+    sourceId: r.get("sourceId") as string,
+    targetId: r.get("targetId") as string,
+    relationType: r.get("relationType") as string,
+    factText: (r.get("factText") as string) ?? "",
+    validFrom: r.get("validFrom") as string,
+    validUntil: (r.get("validUntil") as string | null) ?? null,
+    confidence: Number(r.get("confidence")),
+  }));
+
+  const episodeCypher = sessionId
+    ? `
+      MATCH (ep:Episode { userId: $userId, sessionId: $sessionId })
+      RETURN
+        ep.episodeId AS episodeId,
+        ep.sessionId AS sessionId,
+        ep.actor AS actor,
+        ep.content AS content,
+        toString(ep.occurredAt) AS occurredAt
+      ORDER BY ep.occurredAt
+      `
+    : `
+      MATCH (ep:Episode { userId: $userId })
+      RETURN
+        ep.episodeId AS episodeId,
+        ep.sessionId AS sessionId,
+        ep.actor AS actor,
+        ep.content AS content,
+        toString(ep.occurredAt) AS occurredAt
+      ORDER BY ep.occurredAt
+      `;
+  const episodeRecords = await runQuery(episodeCypher, { userId, sessionId });
+  const episodes: GraphEpisodeNode[] = episodeRecords.map((r) => ({
+    episodeId: r.get("episodeId") as string,
+    sessionId: r.get("sessionId") as string,
+    actor: r.get("actor") as string,
+    content: r.get("content") as string,
+    occurredAt: r.get("occurredAt") as string,
+  }));
+
+  const episodeIdSet = new Set(episodes.map((e) => e.episodeId));
+  const mentionRecords = await runQuery(
+    `
+    MATCH (ep:Episode { userId: $userId })-[:MENTIONS]->(e:Entity)
+    RETURN
+      ep.episodeId AS episodeId,
+      e.entityId AS entityId
+    `,
+    { userId },
+  );
+  const mentions: GraphMentionEdge[] = mentionRecords
+    .map((r) => ({
+      episodeId: r.get("episodeId") as string,
+      entityId: r.get("entityId") as string,
+    }))
+    .filter((m) => episodeIdSet.has(m.episodeId));
+
+  return { entities, facts, episodes, mentions };
+}
+
+export type GraphNodeDetail = {
+  kind: "entity" | "episode";
+  properties: Record<string, unknown>;
+  outgoing: Array<{
+    type: string;
+    relationType?: string;
+    properties: Record<string, unknown>;
+    other: { id: string; kind: "entity" | "episode"; name?: string };
+  }>;
+  incoming: Array<{
+    type: string;
+    relationType?: string;
+    properties: Record<string, unknown>;
+    other: { id: string; kind: "entity" | "episode"; name?: string };
+  }>;
+};
+
+function plainProps(props: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(props)) {
+    if (v === null || v === undefined) {
+      out[k] = v;
+    } else if (typeof v === "object" && v !== null && "toString" in v) {
+      out[k] = (v as { toString: () => string }).toString();
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+export class GraphNodeNotFoundError extends Error {
+  constructor() {
+    super("GRAPH_NODE_NOT_FOUND");
+    this.name = "GraphNodeNotFoundError";
+  }
+}
+
+export async function getNodeDetail(
+  userId: string,
+  nodeId: string,
+): Promise<GraphNodeDetail> {
+  const records = await runQuery(
+    `
+    MATCH (n)
+    WHERE n.userId = $userId
+      AND (n.entityId = $nodeId OR n.episodeId = $nodeId)
+    OPTIONAL MATCH (n)-[rOut]->(mOut)
+    OPTIONAL MATCH (mIn)-[rIn]->(n)
+    RETURN
+      n AS node,
+      labels(n) AS labels,
+      collect(DISTINCT { rel: rOut, other: mOut, dir: 'out' }) AS outgoing,
+      collect(DISTINCT { rel: rIn, other: mIn, dir: 'in' }) AS incoming
+    `,
+    { userId, nodeId },
+  );
+
+  if (records.length === 0) {
+    throw new GraphNodeNotFoundError();
+  }
+
+  const r = records[0];
+  const node = r.get("node");
+  if (!node) throw new GraphNodeNotFoundError();
+
+  const labels = r.get("labels") as string[];
+  const kind: "entity" | "episode" = labels.includes("Entity")
+    ? "entity"
+    : "episode";
+  const nodeIdValue =
+    node.properties.entityId ?? node.properties.episodeId;
+  const properties = plainProps(node.properties);
+
+  const otherKind = (other: { properties: Record<string, unknown> }) =>
+    other.properties.entityId ? "entity" : "episode";
+
+  const outgoingRaw = (r.get("outgoing") as Array<{
+    rel: { type: string; properties: Record<string, unknown> } | null;
+    other: { properties: Record<string, unknown> } | null;
+  }>) ?? [];
+  const outgoing = outgoingRaw
+    .filter((x) => x.rel && x.other)
+    .map((x) => {
+      const otherProps = x.other!.properties;
+      const k = otherKind({ properties: otherProps });
+      return {
+        type: x.rel!.type,
+        relationType:
+          (x.rel!.properties.relationType as string | undefined) ?? undefined,
+        properties: plainProps(x.rel!.properties),
+        other: {
+          id: (otherProps.entityId ?? otherProps.episodeId) as string,
+          kind: k as "entity" | "episode",
+          name:
+            (otherProps.name as string | undefined) ??
+            (otherProps.content
+              ? String(otherProps.content).slice(0, 50)
+              : undefined),
+        },
+      };
+    });
+
+  const incomingRaw = (r.get("incoming") as Array<{
+    rel: { type: string; properties: Record<string, unknown> } | null;
+    other: { properties: Record<string, unknown> } | null;
+  }>) ?? [];
+  const incoming = incomingRaw
+    .filter((x) => x.rel && x.other)
+    .map((x) => {
+      const otherProps = x.other!.properties;
+      const k = otherKind({ properties: otherProps });
+      return {
+        type: x.rel!.type,
+        relationType:
+          (x.rel!.properties.relationType as string | undefined) ?? undefined,
+        properties: plainProps(x.rel!.properties),
+        other: {
+          id: (otherProps.entityId ?? otherProps.episodeId) as string,
+          kind: k as "entity" | "episode",
+          name:
+            (otherProps.name as string | undefined) ??
+            (otherProps.content
+              ? String(otherProps.content).slice(0, 50)
+              : undefined),
+        },
+      };
+    });
+
+  return {
+    kind,
+    properties: { ...properties, _id: nodeIdValue as string },
+    outgoing,
+    incoming,
+  };
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/services/graph.service.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:02:45Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { z } from "zod";
+
+export const graphQuerySchema = z.object({
+  sessionId: z.uuid().optional(),
+});
+
+export type GraphQueryInput = z.infer<typeof graphQuerySchema>;
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/validators/graph.validator.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:03:04Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import type { Context } from "hono";
+import { z } from "zod";
+import type { AuthVariables } from "../middleware/auth.middleware";
+import { graphQuerySchema } from "../validators/graph.validator";
+import {
+  getUserGraph,
+  getNodeDetail,
+  GraphNodeNotFoundError,
+} from "../services/graph.service";
+
+export async function getGraph(c: Context<{ Variables: AuthVariables }>) {
+  const userId = c.get("userId");
+  const sessionIdQuery = c.req.query("sessionId");
+  const parsed = graphQuerySchema.safeParse({
+    sessionId: sessionIdQuery,
+  });
+  if (!parsed.success) {
+    return c.json(
+      { error: "VALIDATION_ERROR", issues: parsed.error.issues },
+      400,
+    );
+  }
+  const snapshot = await getUserGraph(userId, parsed.data.sessionId);
+  return c.json(snapshot);
+}
+
+export async function getGraphNode(
+  c: Context<{ Variables: AuthVariables }>,
+) {
+  const userId = c.get("userId");
+  const idParam = c.req.param("id");
+  const parsed = z.uuid().safeParse(idParam);
+  if (!parsed.success) {
+    return c.json({ error: "INVALID_ID" }, 400);
+  }
+  try {
+    const detail = await getNodeDetail(userId, parsed.data);
+    return c.json(detail);
+  } catch (err) {
+    if (err instanceof GraphNodeNotFoundError) {
+      return c.json({ error: "NODE_NOT_FOUND" }, 404);
+    }
+    throw err;
+  }
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/controllers/graph.controller.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:03:09Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import { Hono } from "hono";
+import type { AuthVariables } from "../middleware/auth.middleware";
+import { getGraph, getGraphNode } from "../controllers/graph.controller";
+
+export const graphRouter = new Hono<{ Variables: AuthVariables }>();
+
+graphRouter.get("/", getGraph);
+graphRouter.get("/node/:id", getGraphNode);
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/routes/graph.routes.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:03:13Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./server/src/index.ts`
+
+```text
+1	import { Hono } from "hono";
+2	import { logger } from "hono/logger";
+3	import { cors } from "hono/cors";
+4	import { authRouter } from "./routes/auth.routes";
+5	import { sessionsRouter } from "./routes/sessions.routes";
+6	import { ingestRouter } from "./routes/ingest.routes";
+7	import { episodesRouter } from "./routes/episodes.routes";
+8	import { retrieveRouter } from "./routes/retrieve.routes";
+9	import {
+10	  requireAuth,
+11	  type AuthVariables,
+12	} from "./middleware/auth.middleware";
+13	
+14	const app = new Hono<{ Variables: AuthVariables }>();
+15	
+16	app.use("*", logger());
+17	app.use("*", cors());
+18	
+19	app.get("/", (c) => c.text("Zep memory server"));
+20	
+21	app.route("/auth", authRouter);
+22	
+23	const protectedRoutes = new Hono<{ Variables: AuthVariables }>();
+24	protectedRoutes.use("*", requireAuth);
+25	protectedRoutes.get("/me", (c) => c.json({ userId: c.get("userId") }));
+26	protectedRoutes.route("/sessions", sessionsRouter);
+27	protectedRoutes.route("/ingest", ingestRouter);
+28	protectedRoutes.route("/episodes", episodesRouter);
+29	protectedRoutes.route("/retrieve", retrieveRouter);
+30	
+31	app.route("/", protectedRoutes);
+32	
+33	export default {
+34	  port: 3002,
+35	  fetch: app.fetch,
+36	};
+37
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:03:21Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/index.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:03:25Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/server/src/index.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:03:29Z)**_
+
+Backend additions done. Now the frontend. Installing React Flow + dagre for layout.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:03:46Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Install React Flow and dagre for graph viz
+
+`cd /Users/karthiknadar/Desktop/zep-paper-implementation/client && bun add @xyflow/react @dagrejs/dagre 2>&1 | tail -20`
+
+```text
+bun add v1.3.3 (274e01c7)
+[10.77ms] migrated lockfile from package-lock.json
+Resolving dependencies
+Resolved, downloaded and extracted [67]
+Saved lockfile
+
+installed @xyflow/react@12.10.2
+installed @dagrejs/dagre@3.0.0
+
+54 packages installed [5.36s]
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:03:51Z)**_
+
+Now the frontend. Building in this order: API client + types → auth provider → app shell → panels → graph. Let me create the foundational lib files first.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:04:05Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
+
+const TOKEN_STORAGE_KEY = "zep.token";
+const USER_STORAGE_KEY = "zep.user";
+
+export type StoredUser = {
+  userId: string;
+  email: string;
+};
+
+export function getToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+}
+
+export function getStoredUser(): StoredUser | null {
+  if (typeof window === "undefined") return null;
+  const raw = window.localStorage.getItem(USER_STORAGE_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as StoredUser;
+  } catch {
+    return null;
+  }
+}
+
+export function saveSession(token: string, user: StoredUser) {
+  window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
+}
+
+export function clearSession() {
+  window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  window.localStorage.removeItem(USER_STORAGE_KEY);
+}
+
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+  constructor(status: number, body: unknown, message: string) {
+    super(message);
+    this.status = status;
+    this.body = body;
+    this.name = "ApiError";
+  }
+}
+
+type FetchOptions = {
+  method?: string;
+  body?: unknown;
+  authenticated?: boolean;
+  signal?: AbortSignal;
+};
+
+export async function api<T = unknown>(
+  path: string,
+  options: FetchOptions = {},
+): Promise<T> {
+  const {
+    method = "GET",
+    body,
+    authenticated = true,
+    signal,
+  } = options;
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (authenticated) {
+    const token = getToken();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal,
+  });
+
+  let parsed: unknown = null;
+  const text = await res.text();
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = text;
+    }
+  }
+
+  if (!res.ok) {
+    if (res.status === 401) {
+      clearSession();
+    }
+    const message =
+      (parsed && typeof parsed === "object" && "error" in parsed
+        ? String((parsed as { error: unknown }).error)
+        : null) ?? `Request failed with status ${res.status}`;
+    throw new ApiError(res.status, parsed, message);
+  }
+
+  return parsed as T;
+}
+
+export type AuthResponse = {
+  token: string;
+  userId: string;
+  email: string;
+};
+
+export type Session = {
+  id: string;
+  userId: string;
+  title: string | null;
+  createdAt: string;
+};
+
+export type EpisodeStatus = "queued" | "processing" | "processed" | "failed";
+
+export type Episode = {
+  id: string;
+  userId: string;
+  sessionId: string;
+  actor: "user" | "assistant" | "system";
+  content: string;
+  status: EpisodeStatus;
+  metadata: unknown;
+  occurredAt: string;
+  createdAt: string;
+  processedAt: string | null;
+};
+
+export type ProcessingLog = {
+  id: string;
+  episodeId: string;
+  step: string;
+  status: "ok" | "error";
+  message: string | null;
+  durationMs: number | null;
+  createdAt: string;
+};
+
+export type IngestResponse = {
+  episodeId: string;
+  status: EpisodeStatus;
+};
+
+export type GraphEntityNode = {
+  entityId: string;
+  name: string;
+  normalizedName: string;
+  type: string;
+  summary: string;
+};
+
+export type GraphFactEdge = {
+  factId: string;
+  sourceId: string;
+  targetId: string;
+  relationType: string;
+  factText: string;
+  validFrom: string;
+  validUntil: string | null;
+  confidence: number;
+};
+
+export type GraphEpisodeNode = {
+  episodeId: string;
+  sessionId: string;
+  actor: string;
+  content: string;
+  occurredAt: string;
+};
+
+export type GraphMentionEdge = {
+  episodeId: string;
+  entityId: string;
+};
+
+export type GraphSnapshot = {
+  entities: GraphEntityNode[];
+  facts: GraphFactEdge[];
+  episodes: GraphEpisodeNode[];
+  mentions: GraphMentionEdge[];
+};
+
+export type GraphNodeDetail = {
+  kind: "entity" | "episode";
+  properties: Record<string, unknown>;
+  outgoing: Array<{
+    type: string;
+    relationType?: string;
+    properties: Record<string, unknown>;
+    other: { id: string; kind: "entity" | "episode"; name?: string };
+  }>;
+  incoming: Array<{
+    type: string;
+    relationType?: string;
+    properties: Record<string, unknown>;
+    other: { id: string; kind: "entity" | "episode"; name?: string };
+  }>;
+};
+
+export type ScoredFact = {
+  factId: string;
+  sourceId: string;
+  sourceName: string;
+  sourceType: string;
+  relationType: string;
+  targetId: string;
+  targetName: string;
+  targetType: string;
+  factText: string;
+  validFrom: string;
+  validUntil: string | null;
+  confidence: number;
+  hop: number;
+  vectorScore: number;
+  recencyScore: number;
+  hopScore: number;
+  llmScore?: number;
+  totalScore: number;
+};
+
+export type RetrievalResult = {
+  answer: string;
+  context: string;
+  facts: ScoredFact[];
+  recentMessages: Array<{
+    actor: string;
+    content: string;
+    occurredAt: string;
+  }>;
+  asOf: string;
+};
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/lib/api.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:04:37Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```typescript
+import dagre from "@dagrejs/dagre";
+import type { Edge, Node } from "@xyflow/react";
+
+export function layoutGraph(nodes: Node[], edges: Edge[]): Node[] {
+  if (nodes.length === 0) return nodes;
+
+  const g = new dagre.graphlib.Graph();
+  g.setDefaultEdgeLabel(() => ({}));
+  g.setGraph({
+    rankdir: "TB",
+    nodesep: 60,
+    ranksep: 90,
+    edgesep: 40,
+    marginx: 40,
+    marginy: 40,
+  });
+
+  for (const n of nodes) {
+    const width =
+      n.type === "episode" ? 240 : n.type === "self" ? 140 : 160;
+    const height = n.type === "episode" ? 80 : 56;
+    g.setNode(n.id, { width, height });
+  }
+
+  for (const e of edges) {
+    g.setEdge(e.source, e.target);
+  }
+
+  dagre.layout(g);
+
+  return nodes.map((node) => {
+    const positioned = g.node(node.id);
+    if (!positioned) return node;
+    return {
+      ...node,
+      position: {
+        x: positioned.x - positioned.width / 2,
+        y: positioned.y - positioned.height / 2,
+      },
+    };
+  });
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/lib/graph-layout.ts (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:04:40Z)**_
+
+Now the auth provider — a React context wrapped around the app.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:04:47Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+"use client";
+
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import {
+  api,
+  type AuthResponse,
+  clearSession,
+  getStoredUser,
+  saveSession,
+  type StoredUser,
+} from "@/lib/api";
+
+type AuthState = {
+  user: StoredUser | null;
+  loading: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  signup: (email: string, password: string) => Promise<void>;
+  logout: () => void;
+};
+
+const AuthContext = createContext<AuthState | null>(null);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<StoredUser | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setUser(getStoredUser());
+    setLoading(false);
+  }, []);
+
+  const login = useCallback(async (email: string, password: string) => {
+    const res = await api<AuthResponse>("/auth/login", {
+      method: "POST",
+      body: { email, password },
+      authenticated: false,
+    });
+    saveSession(res.token, { userId: res.userId, email: res.email });
+    setUser({ userId: res.userId, email: res.email });
+  }, []);
+
+  const signup = useCallback(async (email: string, password: string) => {
+    const res = await api<AuthResponse>("/auth/signup", {
+      method: "POST",
+      body: { email, password },
+      authenticated: false,
+    });
+    saveSession(res.token, { userId: res.userId, email: res.email });
+    setUser({ userId: res.userId, email: res.email });
+  }, []);
+
+  const logout = useCallback(() => {
+    clearSession();
+    setUser(null);
+  }, []);
+
+  const value = useMemo<AuthState>(
+    () => ({ user, loading, login, signup, logout }),
+    [user, loading, login, signup, logout],
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+export function useAuth(): AuthState {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used within AuthProvider");
+  return ctx;
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/providers/auth-provider.tsx (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:04:59Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+"use client";
+
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { api, type Session } from "@/lib/api";
+import { useAuth } from "./auth-provider";
+
+type SessionState = {
+  sessions: Session[];
+  currentSessionId: string | null;
+  setCurrentSessionId: (id: string | null) => void;
+  loading: boolean;
+  error: string | null;
+  refresh: () => Promise<void>;
+  createSession: (title?: string) => Promise<Session>;
+};
+
+const SessionContext = createContext<SessionState | null>(null);
+
+const ACTIVE_SESSION_KEY = "zep.activeSessionId";
+
+export function SessionsProvider({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [currentSessionId, setCurrentSessionIdState] = useState<string | null>(
+    null,
+  );
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    if (!user) {
+      setSessions([]);
+      setCurrentSessionIdState(null);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await api<{ sessions: Session[] }>("/sessions");
+      setSessions(res.sessions);
+      const storedActive =
+        typeof window !== "undefined"
+          ? window.localStorage.getItem(ACTIVE_SESSION_KEY)
+          : null;
+      if (storedActive && res.sessions.some((s) => s.id === storedActive)) {
+        setCurrentSessionIdState(storedActive);
+      } else if (res.sessions.length > 0 && !currentSessionId) {
+        setCurrentSessionIdState(res.sessions[0].id);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load sessions");
+    } finally {
+      setLoading(false);
+    }
+  }, [user, currentSessionId]);
+
+  useEffect(() => {
+    void refresh();
+  }, [user]);
+
+  const setCurrentSessionId = useCallback((id: string | null) => {
+    setCurrentSessionIdState(id);
+    if (typeof window !== "undefined") {
+      if (id) {
+        window.localStorage.setItem(ACTIVE_SESSION_KEY, id);
+      } else {
+        window.localStorage.removeItem(ACTIVE_SESSION_KEY);
+      }
+    }
+  }, []);
+
+  const createSession = useCallback(
+    async (title?: string): Promise<Session> => {
+      const body = title ? { title } : {};
+      const res = await api<{ session: Session }>("/sessions", {
+        method: "POST",
+        body,
+      });
+      setSessions((prev) => [res.session, ...prev]);
+      setCurrentSessionId(res.session.id);
+      return res.session;
+    },
+    [setCurrentSessionId],
+  );
+
+  const value = useMemo<SessionState>(
+    () => ({
+      sessions,
+      currentSessionId,
+      setCurrentSessionId,
+      loading,
+      error,
+      refresh,
+      createSession,
+    }),
+    [sessions, currentSessionId, loading, error, refresh, createSession, setCurrentSessionId],
+  );
+
+  return (
+    <SessionContext.Provider value={value}>{children}</SessionContext.Provider>
+  );
+}
+
+export function useSessions(): SessionState {
+  const ctx = useContext(SessionContext);
+  if (!ctx) throw new Error("useSessions must be used within SessionsProvider");
+  return ctx;
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/providers/session-provider.tsx (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:05:17Z)**_
+
+Now the auth UI — a single page that handles both login and signup with a toggle.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:05:17Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+"use client";
+
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { useAuth } from "@/components/providers/auth-provider";
+import { ApiError } from "@/lib/api";
+import { Brain } from "lucide-react";
+
+type Mode = "login" | "signup";
+
+export function AuthScreen() {
+  const { login, signup } = useAuth();
+  const [mode, setMode] = useState<Mode>("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      if (mode === "login") {
+        await login(email, password);
+      } else {
+        await signup(email, password);
+      }
+    } catch (err) {
+      if (err instanceof ApiError) {
+        if (err.status === 401) {
+          setError("Invalid email or password.");
+        } else if (err.status === 409) {
+          setError("An account with this email already exists.");
+        } else if (err.status === 400) {
+          setError("Email must be valid and password must be at least 8 characters.");
+        } else {
+          setError(err.message);
+        }
+      } else {
+        setError(err instanceof Error ? err.message : "Something went wrong.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center px-6 bg-muted/30">
+      <div className="w-full max-w-md flex flex-col items-center">
+        <div className="flex items-center gap-2 mb-8 text-foreground">
+          <Brain className="h-6 w-6" strokeWidth={1.75} />
+          <span className="font-semibold tracking-tight text-lg">Zep Memory</span>
+        </div>
+        <Card className="w-full">
+          <CardHeader>
+            <CardTitle className="text-xl">
+              {mode === "login" ? "Sign in" : "Create an account"}
+            </CardTitle>
+            <CardDescription>
+              {mode === "login"
+                ? "Welcome back. Enter your credentials to continue."
+                : "A new email + password is all you need."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={onSubmit} className="flex flex-col gap-4">
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="email">Email</Label>
+                <Input
+                  id="email"
+                  type="email"
+                  autoComplete="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  disabled={busy}
+                  placeholder="you@example.com"
+                />
+              </div>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="password">Password</Label>
+                <Input
+                  id="password"
+                  type="password"
+                  autoComplete={mode === "login" ? "current-password" : "new-password"}
+                  required
+                  minLength={8}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  disabled={busy}
+                  placeholder="At least 8 characters"
+                />
+              </div>
+              {error ? (
+                <div className="text-sm text-destructive rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2">
+                  {error}
+                </div>
+              ) : null}
+              <Button type="submit" disabled={busy} className="mt-2">
+                {busy ? "Working…" : mode === "login" ? "Sign in" : "Create account"}
+              </Button>
+            </form>
+            <div className="mt-4 text-sm text-muted-foreground text-center">
+              {mode === "login" ? (
+                <>
+                  No account?{" "}
+                  <button
+                    type="button"
+                    className="font-medium text-foreground hover:underline"
+                    onClick={() => {
+                      setMode("signup");
+                      setError(null);
+                    }}
+                  >
+                    Sign up
+                  </button>
+                </>
+              ) : (
+                <>
+                  Already have one?{" "}
+                  <button
+                    type="button"
+                    className="font-medium text-foreground hover:underline"
+                    onClick={() => {
+                      setMode("login");
+                      setError(null);
+                    }}
+                  >
+                    Sign in
+                  </button>
+                </>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/auth/auth-screen.tsx (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:05:20Z)**_
+
+Now the sidebar (session management).
+
+_**Agent (claude-opus-4-7 2026-05-11 17:05:21Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Check sidebar component API
+
+`head -50 /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/ui/sidebar.tsx`
+
+```text
+"use client"
+
+import * as React from "react"
+import { cva, type VariantProps } from "class-variance-authority"
+import { Slot } from "radix-ui"
+
+import { useIsMobile } from "@/hooks/use-mobile"
+import { cn } from "@/lib/utils"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Separator } from "@/components/ui/separator"
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet"
+import { Skeleton } from "@/components/ui/skeleton"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
+import { PanelLeftIcon } from "lucide-react"
+
+const SIDEBAR_COOKIE_NAME = "sidebar_state"
+const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
+const SIDEBAR_WIDTH = "16rem"
+const SIDEBAR_WIDTH_MOBILE = "18rem"
+const SIDEBAR_WIDTH_ICON = "3rem"
+const SIDEBAR_KEYBOARD_SHORTCUT = "b"
+
+type SidebarContextProps = {
+  state: "expanded" | "collapsed"
+  open: boolean
+  setOpen: (open: boolean) => void
+  openMobile: boolean
+  setOpenMobile: (open: boolean) => void
+  isMobile: boolean
+  toggleSidebar: () => void
+}
+
+const SidebarContext = React.createContext<SidebarContextProps | null>(null)
+
+function useSidebar() {
+  const context = React.useContext(SidebarContext)
+  if (!context) {
+    throw new Error("useSidebar must be used within a SidebarProvider.")
+  }
+```
+</details></tool-use>
+
+---
+
+_**User (2026-05-11 17:10:35Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-05-11 17:10:39Z)**_
+
+please continue
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-11 17:10:43Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 17:10:44Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+List sidebar exports
+
+`grep -n "^function\|^export" /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/ui/sidebar.tsx | head -30`
+
+```text
+46:function useSidebar() {
+55:function SidebarProvider({
+151:function Sidebar({
+253:function SidebarTrigger({
+279:function SidebarRail({ className, ...props }: React.ComponentProps<"button">) {
+304:function SidebarInset({ className, ...props }: React.ComponentProps<"main">) {
+317:function SidebarInput({
+331:function SidebarHeader({ className, ...props }: React.ComponentProps<"div">) {
+342:function SidebarFooter({ className, ...props }: React.ComponentProps<"div">) {
+353:function SidebarSeparator({
+367:function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
+381:function SidebarGroup({ className, ...props }: React.ComponentProps<"div">) {
+392:function SidebarGroupLabel({
+412:function SidebarGroupAction({
+432:function SidebarGroupContent({
+446:function SidebarMenu({ className, ...props }: React.ComponentProps<"ul">) {
+457:function SidebarMenuItem({ className, ...props }: React.ComponentProps<"li">) {
+490:function SidebarMenuButton({
+540:function SidebarMenuAction({
+566:function SidebarMenuBadge({
+583:function SidebarMenuSkeleton({
+621:function SidebarMenuSub({ className, ...props }: React.ComponentProps<"ul">) {
+635:function SidebarMenuSubItem({
+649:function SidebarMenuSubButton({
+677:export {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:10:48Z)**_
+
+Good, all the standard shadcn sidebar primitives are available. Building the sidebar component.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:11:08Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+"use client";
+
+import { useState } from "react";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+} from "@/components/ui/sidebar";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Brain, Plus, LogOut, Check } from "lucide-react";
+import { useSessions } from "@/components/providers/session-provider";
+import { useAuth } from "@/components/providers/auth-provider";
+import { Skeleton } from "@/components/ui/skeleton";
+import { format } from "date-fns";
+
+export function SessionsSidebar() {
+  const { sessions, currentSessionId, setCurrentSessionId, loading, createSession } =
+    useSessions();
+  const { user, logout } = useAuth();
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    setCreating(true);
+    try {
+      await createSession(newTitle.trim() || undefined);
+      setNewTitle("");
+      setDialogOpen(false);
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  const initials = user?.email?.[0]?.toUpperCase() ?? "?";
+
+  return (
+    <Sidebar collapsible="icon" variant="inset">
+      <SidebarHeader>
+        <div className="flex items-center gap-2 px-2 py-1.5">
+          <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
+            <Brain className="h-4 w-4" strokeWidth={1.75} />
+          </div>
+          <div className="grid flex-1 text-left text-sm leading-tight group-data-[collapsible=icon]:hidden">
+            <span className="truncate font-semibold">Zep Memory</span>
+            <span className="truncate text-xs text-muted-foreground">
+              Knowledge graph
+            </span>
+          </div>
+        </div>
+      </SidebarHeader>
+
+      <SidebarContent>
+        <SidebarGroup>
+          <div className="flex items-center justify-between gap-2">
+            <SidebarGroupLabel>Sessions</SidebarGroupLabel>
+            <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+              <DialogTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-6 group-data-[collapsible=icon]:hidden"
+                  title="New session"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="sm:max-w-md">
+                <form onSubmit={handleCreate}>
+                  <DialogHeader>
+                    <DialogTitle>New session</DialogTitle>
+                    <DialogDescription>
+                      A session groups related messages. Title is optional.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="py-4">
+                    <Input
+                      autoFocus
+                      placeholder="e.g. weekly notes, personal log…"
+                      value={newTitle}
+                      onChange={(e) => setNewTitle(e.target.value)}
+                      disabled={creating}
+                    />
+                  </div>
+                  <DialogFooter>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      onClick={() => setDialogOpen(false)}
+                      disabled={creating}
+                    >
+                      Cancel
+                    </Button>
+                    <Button type="submit" disabled={creating}>
+                      {creating ? "Creating…" : "Create session"}
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </DialogContent>
+            </Dialog>
+          </div>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {loading && sessions.length === 0 ? (
+                <>
+                  <SidebarMenuItem>
+                    <Skeleton className="h-8 w-full" />
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <Skeleton className="h-8 w-full" />
+                  </SidebarMenuItem>
+                </>
+              ) : sessions.length === 0 ? (
+                <SidebarMenuItem>
+                  <div className="px-2 py-1.5 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
+                    No sessions yet. Create one to begin.
+                  </div>
+                </SidebarMenuItem>
+              ) : (
+                sessions.map((s) => {
+                  const label = s.title?.trim() || "Untitled session";
+                  const isActive = s.id === currentSessionId;
+                  return (
+                    <SidebarMenuItem key={s.id}>
+                      <SidebarMenuButton
+                        isActive={isActive}
+                        onClick={() => setCurrentSessionId(s.id)}
+                        tooltip={label}
+                      >
+                        {isActive ? (
+                          <Check className="h-3.5 w-3.5 shrink-0" />
+                        ) : (
+                          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-muted-foreground/40" />
+                        )}
+                        <div className="flex min-w-0 flex-col">
+                          <span className="truncate text-sm">{label}</span>
+                          <span className="truncate text-[10px] text-muted-foreground">
+                            {format(new Date(s.createdAt), "MMM d, HH:mm")}
+                          </span>
+                        </div>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  );
+                })
+              )}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+      </SidebarContent>
+
+      <SidebarFooter>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              className="w-full justify-start gap-2 px-2 h-10"
+            >
+              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-muted text-xs font-medium">
+                {initials}
+              </div>
+              <div className="grid flex-1 text-left leading-tight group-data-[collapsible=icon]:hidden">
+                <span className="truncate text-sm">{user?.email}</span>
+                <span className="truncate text-[10px] text-muted-foreground">
+                  Signed in
+                </span>
+              </div>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="end"
+            side="top"
+            className="w-56"
+          >
+            <DropdownMenuItem disabled className="text-xs">
+              {user?.email}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={logout}>
+              <LogOut className="h-3.5 w-3.5" />
+              Sign out
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </SidebarFooter>
+    </Sidebar>
+  );
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/sessions-sidebar.tsx (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:11:15Z)**_
+
+Now the three panels — ingest, graph, retrieve. Starting with ingest.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:11:35Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Textarea } from "@/components/ui/textarea";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useSessions } from "@/components/providers/session-provider";
+import { api, ApiError, type Episode, type EpisodeStatus, type IngestResponse } from "@/lib/api";
+import { format } from "date-fns";
+import { Loader2, Send, CheckCircle2, XCircle, Clock } from "lucide-react";
+import { toast } from "sonner";
+
+type IngestPanelProps = {
+  onProcessed: () => void;
+};
+
+type Tracked = {
+  id: string;
+  content: string;
+  status: EpisodeStatus;
+  occurredAt: string;
+};
+
+export function IngestPanel({ onProcessed }: IngestPanelProps) {
+  const { currentSessionId } = useSessions();
+  const [content, setContent] = useState("");
+  const [sending, setSending] = useState(false);
+  const [tracked, setTracked] = useState<Tracked[]>([]);
+  const pollersRef = useRef(new Map<string, ReturnType<typeof setInterval>>());
+  const lastProcessedNotifyRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    setTracked([]);
+    for (const interval of pollersRef.current.values()) clearInterval(interval);
+    pollersRef.current.clear();
+    lastProcessedNotifyRef.current.clear();
+  }, [currentSessionId]);
+
+  useEffect(() => {
+    return () => {
+      for (const interval of pollersRef.current.values()) clearInterval(interval);
+      pollersRef.current.clear();
+    };
+  }, []);
+
+  const updateTracked = useCallback(
+    (id: string, patch: Partial<Tracked>) => {
+      setTracked((prev) =>
+        prev.map((t) => (t.id === id ? { ...t, ...patch } : t)),
+      );
+    },
+    [],
+  );
+
+  const startPolling = useCallback(
+    (episodeId: string) => {
+      if (pollersRef.current.has(episodeId)) return;
+      const interval = setInterval(async () => {
+        try {
+          const res = await api<{ episode: Episode }>(`/episodes/${episodeId}`);
+          updateTracked(episodeId, { status: res.episode.status });
+          if (
+            res.episode.status === "processed" ||
+            res.episode.status === "failed"
+          ) {
+            const i = pollersRef.current.get(episodeId);
+            if (i) clearInterval(i);
+            pollersRef.current.delete(episodeId);
+            if (
+              res.episode.status === "processed" &&
+              !lastProcessedNotifyRef.current.has(episodeId)
+            ) {
+              lastProcessedNotifyRef.current.add(episodeId);
+              onProcessed();
+            }
+            if (res.episode.status === "failed") {
+              toast.error("Episode failed to process. Check server logs.");
+            }
+          }
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 404) {
+            const i = pollersRef.current.get(episodeId);
+            if (i) clearInterval(i);
+            pollersRef.current.delete(episodeId);
+          }
+        }
+      }, 1500);
+      pollersRef.current.set(episodeId, interval);
+    },
+    [updateTracked, onProcessed],
+  );
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!currentSessionId) return;
+    const trimmed = content.trim();
+    if (!trimmed) return;
+    setSending(true);
+    try {
+      const res = await api<IngestResponse>("/ingest", {
+        method: "POST",
+        body: {
+          sessionId: currentSessionId,
+          actor: "user",
+          content: trimmed,
+        },
+      });
+      const optimistic: Tracked = {
+        id: res.episodeId,
+        content: trimmed,
+        status: res.status,
+        occurredAt: new Date().toISOString(),
+      };
+      setTracked((prev) => [optimistic, ...prev]);
+      setContent("");
+      startPolling(res.episodeId);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to ingest");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <Card className="h-full flex flex-col gap-0 overflow-hidden">
+      <CardHeader className="border-b">
+        <CardTitle className="text-sm font-medium tracking-wide uppercase text-muted-foreground">
+          Ingest
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex-1 flex flex-col gap-3 overflow-hidden p-4">
+        <form onSubmit={handleSubmit} className="flex flex-col gap-2">
+          <Textarea
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+            placeholder="Tell the system something about you. Try 'I love dogs.' or 'I work at Anthropic.'"
+            disabled={sending || !currentSessionId}
+            rows={3}
+            className="resize-none"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                if (!sending && content.trim() && currentSessionId) {
+                  void handleSubmit(e as unknown as React.FormEvent);
+                }
+              }
+            }}
+          />
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-muted-foreground">
+              ⌘/Ctrl + Enter
+            </span>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={sending || !content.trim() || !currentSessionId}
+            >
+              {sending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Send className="h-3.5 w-3.5" />
+              )}
+              {sending ? "Sending…" : "Send"}
+            </Button>
+          </div>
+        </form>
+
+        <div className="flex-1 min-h-0 flex flex-col gap-2">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            Recent
+          </div>
+          <ScrollArea className="flex-1 -mx-2 px-2">
+            <div className="flex flex-col gap-2">
+              {tracked.length === 0 ? (
+                <div className="text-xs text-muted-foreground py-6 text-center border border-dashed rounded-md">
+                  Ingested messages appear here.
+                </div>
+              ) : (
+                tracked.map((t) => <IngestRow key={t.id} t={t} />)
+              )}
+            </div>
+          </ScrollArea>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function IngestRow({ t }: { t: Tracked }) {
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border bg-background p-2.5">
+      <p className="text-sm leading-snug">{t.content}</p>
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] text-muted-foreground">
+          {format(new Date(t.occurredAt), "HH:mm:ss")}
+        </span>
+        <StatusBadge status={t.status} />
+      </div>
+    </div>
+  );
+}
+
+function StatusBadge({ status }: { status: EpisodeStatus }) {
+  if (status === "queued")
+    return (
+      <Badge variant="secondary" className="gap-1 text-[10px]">
+        <Clock className="h-2.5 w-2.5" /> queued
+      </Badge>
+    );
+  if (status === "processing")
+    return (
+      <Badge variant="secondary" className="gap-1 text-[10px]">
+        <Loader2 className="h-2.5 w-2.5 animate-spin" /> processing
+      </Badge>
+    );
+  if (status === "processed")
+    return (
+      <Badge variant="default" className="gap-1 text-[10px]">
+        <CheckCircle2 className="h-2.5 w-2.5" /> processed
+      </Badge>
+    );
+  return (
+    <Badge variant="destructive" className="gap-1 text-[10px]">
+      <XCircle className="h-2.5 w-2.5" /> failed
+    </Badge>
+  );
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/ingest-panel.tsx (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:11:39Z)**_
+
+Now the **graph panel** — React Flow with custom nodes for entities and episodes, and edge styling for closed/open facts. This is the centerpiece.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:12:19Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Background,
+  BackgroundVariant,
+  ConnectionLineType,
+  Controls,
+  Handle,
+  MarkerType,
+  Position,
+  ReactFlow,
+  ReactFlowProvider,
+  useEdgesState,
+  useNodesState,
+  type Edge,
+  type Node,
+  type NodeProps,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
+import { useSessions } from "@/components/providers/session-provider";
+import { api, ApiError, type GraphSnapshot } from "@/lib/api";
+import { layoutGraph } from "@/lib/graph-layout";
+import { Loader2, RefreshCw, Sparkles } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { NodeDetailSheet } from "./node-detail-sheet";
+
+const ENTITY_COLORS: Record<string, string> = {
+  PERSON: "border-blue-300 bg-blue-50 text-blue-900 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-100",
+  COMPANY: "border-violet-300 bg-violet-50 text-violet-900 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-100",
+  LOCATION: "border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100",
+  CONCEPT: "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100",
+  PRODUCT: "border-pink-300 bg-pink-50 text-pink-900 dark:border-pink-800 dark:bg-pink-950/40 dark:text-pink-100",
+  DATE: "border-cyan-300 bg-cyan-50 text-cyan-900 dark:border-cyan-800 dark:bg-cyan-950/40 dark:text-cyan-100",
+  OTHER: "border-zinc-300 bg-zinc-50 text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100",
+};
+
+type EntityNodeData = {
+  label: string;
+  entityType: string;
+  isSelf: boolean;
+};
+
+type EpisodeNodeData = {
+  content: string;
+  occurredAt: string;
+};
+
+function EntityNode({ data, selected }: NodeProps) {
+  const d = data as unknown as EntityNodeData;
+  const palette = ENTITY_COLORS[d.entityType] ?? ENTITY_COLORS.OTHER;
+  return (
+    <div
+      className={cn(
+        "relative rounded-md border px-3 py-2 shadow-sm min-w-[140px] transition-all",
+        palette,
+        selected && "ring-2 ring-foreground ring-offset-2 ring-offset-background",
+        d.isSelf && "border-dashed",
+      )}
+    >
+      <Handle type="target" position={Position.Top} className="!opacity-0" />
+      <div className="flex flex-col gap-0.5">
+        <div className="text-[9px] font-medium uppercase tracking-wider opacity-60">
+          {d.isSelf ? "Self · PERSON" : d.entityType}
+        </div>
+        <div className="text-xs font-semibold leading-tight truncate">
+          {d.label}
+        </div>
+      </div>
+      <Handle type="source" position={Position.Bottom} className="!opacity-0" />
+    </div>
+  );
+}
+
+function EpisodeNode({ data, selected }: NodeProps) {
+  const d = data as unknown as EpisodeNodeData;
+  return (
+    <div
+      className={cn(
+        "relative rounded-md border bg-muted/40 px-3 py-2 shadow-sm w-[220px] transition-all",
+        selected && "ring-2 ring-foreground ring-offset-2 ring-offset-background",
+      )}
+    >
+      <Handle type="target" position={Position.Top} className="!opacity-0" />
+      <div className="flex flex-col gap-1">
+        <div className="text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+          Episode · {new Date(d.occurredAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+        </div>
+        <div className="text-xs leading-snug text-foreground/90 line-clamp-2">
+          {d.content}
+        </div>
+      </div>
+      <Handle type="source" position={Position.Bottom} className="!opacity-0" />
+    </div>
+  );
+}
+
+const nodeTypes = { entity: EntityNode, episode: EpisodeNode } as const;
+
+export type GraphPanelHandle = {
+  refresh: () => Promise<void>;
+};
+
+export function GraphPanel({
+  refreshSignal,
+}: {
+  refreshSignal: number;
+}) {
+  return (
+    <ReactFlowProvider>
+      <GraphPanelInner refreshSignal={refreshSignal} />
+    </ReactFlowProvider>
+  );
+}
+
+function GraphPanelInner({ refreshSignal }: { refreshSignal: number }) {
+  const { currentSessionId, sessions } = useSessions();
+  const [snapshot, setSnapshot] = useState<GraphSnapshot | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [showClosed, setShowClosed] = useState(true);
+  const [showEpisodes, setShowEpisodes] = useState(true);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedNodeKind, setSelectedNodeKind] = useState<"entity" | "episode" | null>(null);
+
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+
+  const userId = useMemo(() => {
+    if (sessions.length === 0) return null;
+    return sessions[0].userId;
+  }, [sessions]);
+
+  const refresh = useCallback(async () => {
+    if (!currentSessionId) {
+      setSnapshot(null);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await api<GraphSnapshot>(
+        `/graph?sessionId=${encodeURIComponent(currentSessionId)}`,
+      );
+      setSnapshot(data);
+    } catch (err) {
+      if (err instanceof ApiError) setError(err.message);
+      else setError("Failed to load graph");
+    } finally {
+      setLoading(false);
+    }
+  }, [currentSessionId]);
+
+  useEffect(() => {
+    void refresh();
+  }, [currentSessionId, refreshSignal, refresh]);
+
+  useEffect(() => {
+    if (!snapshot) {
+      setNodes([]);
+      setEdges([]);
+      return;
+    }
+
+    const visibleFacts = showClosed
+      ? snapshot.facts
+      : snapshot.facts.filter((f) => f.validUntil === null);
+
+    const entityIds = new Set<string>();
+    for (const f of visibleFacts) {
+      entityIds.add(f.sourceId);
+      entityIds.add(f.targetId);
+    }
+    if (showEpisodes) {
+      for (const m of snapshot.mentions) entityIds.add(m.entityId);
+    }
+    if (entityIds.size === 0) {
+      for (const e of snapshot.entities) entityIds.add(e.entityId);
+    }
+
+    const visibleEntities = snapshot.entities.filter((e) =>
+      entityIds.has(e.entityId),
+    );
+
+    const entityNodes: Node[] = visibleEntities.map((e) => ({
+      id: e.entityId,
+      type: "entity",
+      data: {
+        label: e.name,
+        entityType: e.type,
+        isSelf: userId !== null && e.entityId === userId,
+      },
+      position: { x: 0, y: 0 },
+    }));
+
+    const episodeNodes: Node[] = showEpisodes
+      ? snapshot.episodes.map((ep) => ({
+          id: ep.episodeId,
+          type: "episode",
+          data: {
+            content: ep.content,
+            occurredAt: ep.occurredAt,
+          },
+          position: { x: 0, y: 0 },
+        }))
+      : [];
+
+    const factEdges: Edge[] = visibleFacts.map((f) => {
+      const closed = f.validUntil !== null;
+      return {
+        id: f.factId,
+        source: f.sourceId,
+        target: f.targetId,
+        label: f.relationType,
+        type: "default",
+        animated: false,
+        style: {
+          stroke: closed ? "var(--muted-foreground)" : "var(--foreground)",
+          strokeWidth: closed ? 1 : 1.5,
+          strokeDasharray: closed ? "4 4" : undefined,
+          opacity: closed ? 0.55 : 1,
+        },
+        labelStyle: {
+          fontSize: 10,
+          fontWeight: 500,
+          fill: closed ? "var(--muted-foreground)" : "var(--foreground)",
+        },
+        labelBgStyle: {
+          fill: "var(--background)",
+        },
+        labelBgPadding: [4, 2],
+        labelBgBorderRadius: 4,
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+          color: closed ? "var(--muted-foreground)" : "var(--foreground)",
+          width: 14,
+          height: 14,
+        },
+      };
+    });
+
+    const mentionEdges: Edge[] = showEpisodes
+      ? snapshot.mentions.map((m) => ({
+          id: `mention-${m.episodeId}-${m.entityId}`,
+          source: m.episodeId,
+          target: m.entityId,
+          type: "default",
+          style: {
+            stroke: "var(--muted-foreground)",
+            strokeWidth: 0.75,
+            strokeDasharray: "2 3",
+            opacity: 0.5,
+          },
+          markerEnd: {
+            type: MarkerType.Arrow,
+            color: "var(--muted-foreground)",
+            width: 10,
+            height: 10,
+          },
+        }))
+      : [];
+
+    const allNodes = [...entityNodes, ...episodeNodes];
+    const allEdges = [...factEdges, ...mentionEdges];
+    const laid = layoutGraph(allNodes, allEdges);
+
+    setNodes(laid);
+    setEdges(allEdges);
+  }, [snapshot, showClosed, showEpisodes, userId, setNodes, setEdges]);
+
+  const openCount =
+    snapshot?.facts.filter((f) => f.validUntil === null).length ?? 0;
+  const closedCount =
+    snapshot?.facts.filter((f) => f.validUntil !== null).length ?? 0;
+
+  return (
+    <>
+      <Card className="h-full flex flex-col gap-0 overflow-hidden">
+        <CardHeader className="border-b">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-2">
+              <CardTitle className="text-sm font-medium tracking-wide uppercase text-muted-foreground">
+                Graph
+              </CardTitle>
+              {snapshot ? (
+                <div className="flex items-center gap-1.5">
+                  <Badge variant="outline" className="text-[10px] font-normal">
+                    {snapshot.entities.length} entities
+                  </Badge>
+                  <Badge variant="outline" className="text-[10px] font-normal">
+                    {openCount} open · {closedCount} closed
+                  </Badge>
+                </div>
+              ) : null}
+            </div>
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="show-closed"
+                  checked={showClosed}
+                  onCheckedChange={setShowClosed}
+                />
+                <Label
+                  htmlFor="show-closed"
+                  className="text-xs text-muted-foreground cursor-pointer"
+                >
+                  Closed facts
+                </Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="show-episodes"
+                  checked={showEpisodes}
+                  onCheckedChange={setShowEpisodes}
+                />
+                <Label
+                  htmlFor="show-episodes"
+                  className="text-xs text-muted-foreground cursor-pointer"
+                >
+                  Episodes
+                </Label>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-7"
+                onClick={() => void refresh()}
+                disabled={loading || !currentSessionId}
+                title="Refresh"
+              >
+                <RefreshCw
+                  className={cn("h-3.5 w-3.5", loading && "animate-spin")}
+                />
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="flex-1 min-h-0 p-0 relative">
+          {!currentSessionId ? (
+            <EmptyState message="Select or create a session to view the graph." />
+          ) : error ? (
+            <EmptyState message={error} icon="error" />
+          ) : loading && !snapshot ? (
+            <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin mr-2" />
+              Loading graph…
+            </div>
+          ) : snapshot && snapshot.entities.length === 0 ? (
+            <EmptyState message="The graph is empty. Send a message to start building memory." icon="sparkle" />
+          ) : (
+            <div className="absolute inset-0">
+              <ReactFlow
+                nodes={nodes}
+                edges={edges}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                nodeTypes={nodeTypes}
+                fitView
+                fitViewOptions={{ padding: 0.2 }}
+                proOptions={{ hideAttribution: true }}
+                connectionLineType={ConnectionLineType.Bezier}
+                onNodeClick={(_, node) => {
+                  setSelectedNodeId(node.id);
+                  setSelectedNodeKind(node.type === "episode" ? "episode" : "entity");
+                }}
+                minZoom={0.3}
+                maxZoom={1.5}
+              >
+                <Background variant={BackgroundVariant.Dots} gap={20} size={1} />
+                <Controls
+                  position="bottom-right"
+                  showInteractive={false}
+                  className="!shadow-none !border !rounded-md !bg-background"
+                />
+              </ReactFlow>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <NodeDetailSheet
+        open={selectedNodeId !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setSelectedNodeId(null);
+            setSelectedNodeKind(null);
+          }
+        }}
+        nodeId={selectedNodeId}
+        nodeKind={selectedNodeKind}
+      />
+    </>
+  );
+}
+
+function EmptyState({
+  message,
+  icon = "default",
+}: {
+  message: string;
+  icon?: "default" | "error" | "sparkle";
+}) {
+  return (
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-6">
+      {icon === "sparkle" ? (
+        <Sparkles className="h-6 w-6 text-muted-foreground" strokeWidth={1.5} />
+      ) : null}
+      <p className="text-sm text-muted-foreground max-w-xs">{message}</p>
+    </div>
+  );
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/graph-panel.tsx (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:12:37Z)**_
+
+Now the **node detail sheet** that opens when a node is clicked.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:12:45Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+"use client";
+
+import { useEffect, useState } from "react";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Badge } from "@/components/ui/badge";
+import { Separator } from "@/components/ui/separator";
+import { api, type GraphNodeDetail } from "@/lib/api";
+import { Loader2, ArrowDown, ArrowUp } from "lucide-react";
+import { format } from "date-fns";
+
+type Props = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  nodeId: string | null;
+  nodeKind: "entity" | "episode" | null;
+};
+
+export function NodeDetailSheet({ open, onOpenChange, nodeId, nodeKind }: Props) {
+  const [detail, setDetail] = useState<GraphNodeDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open || !nodeId) {
+      setDetail(null);
+      setError(null);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    void (async () => {
+      try {
+        const d = await api<GraphNodeDetail>(`/graph/node/${nodeId}`);
+        if (!cancelled) setDetail(d);
+      } catch (err) {
+        if (!cancelled)
+          setError(err instanceof Error ? err.message : "Failed to load");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, nodeId]);
+
+  const headerName = detail
+    ? detail.kind === "entity"
+      ? String(detail.properties.name ?? "Entity")
+      : `Episode ${String(detail.properties.episodeId ?? "").slice(0, 8)}`
+    : nodeKind === "entity"
+      ? "Entity"
+      : "Episode";
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent className="w-[420px] sm:w-[440px] sm:max-w-[440px] flex flex-col gap-0">
+        <SheetHeader className="border-b">
+          <div className="flex items-center gap-2">
+            <Badge variant="secondary" className="text-[10px] uppercase tracking-wider">
+              {detail?.kind ?? nodeKind ?? "node"}
+            </Badge>
+            {detail?.kind === "entity" && detail.properties.type ? (
+              <Badge variant="outline" className="text-[10px]">
+                {String(detail.properties.type)}
+              </Badge>
+            ) : null}
+          </div>
+          <SheetTitle className="text-base font-semibold truncate">{headerName}</SheetTitle>
+          {detail?.kind === "entity" && detail.properties.summary ? (
+            <SheetDescription className="text-xs leading-relaxed">
+              {String(detail.properties.summary)}
+            </SheetDescription>
+          ) : detail?.kind === "episode" && detail.properties.content ? (
+            <SheetDescription className="text-xs leading-relaxed">
+              {String(detail.properties.content)}
+            </SheetDescription>
+          ) : null}
+        </SheetHeader>
+
+        <ScrollArea className="flex-1">
+          <div className="p-4 flex flex-col gap-5">
+            {loading ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" /> Loading node…
+              </div>
+            ) : error ? (
+              <div className="text-sm text-destructive">{error}</div>
+            ) : !detail ? null : (
+              <>
+                <Properties detail={detail} />
+                <RelationshipsList
+                  title="Outgoing"
+                  icon={<ArrowDown className="h-3.5 w-3.5" />}
+                  items={detail.outgoing}
+                />
+                <RelationshipsList
+                  title="Incoming"
+                  icon={<ArrowUp className="h-3.5 w-3.5" />}
+                  items={detail.incoming}
+                />
+              </>
+            )}
+          </div>
+        </ScrollArea>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function Properties({ detail }: { detail: GraphNodeDetail }) {
+  const entries = Object.entries(detail.properties).filter(
+    ([k]) => k !== "summary" && k !== "content" && k !== "_id" && k !== "name",
+  );
+  if (entries.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        Properties
+      </div>
+      <div className="rounded-md border bg-muted/30 divide-y">
+        {entries.map(([k, v]) => (
+          <div key={k} className="flex items-baseline gap-3 px-2.5 py-1.5">
+            <span className="text-[10px] uppercase tracking-wider text-muted-foreground min-w-[100px] flex-shrink-0">
+              {k}
+            </span>
+            <span className="text-xs font-mono break-all">
+              {formatValue(k, v)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function formatValue(key: string, value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "string") {
+    if (
+      (key.endsWith("At") || key === "occurredAt" || key === "validFrom" || key === "validUntil") &&
+      value.match(/^\d{4}-\d{2}-\d{2}/)
+    ) {
+      try {
+        return format(new Date(value), "yyyy-MM-dd HH:mm:ss");
+      } catch {
+        return value;
+      }
+    }
+    return value;
+  }
+  return JSON.stringify(value);
+}
+
+function RelationshipsList({
+  title,
+  icon,
+  items,
+}: {
+  title: string;
+  icon: React.ReactNode;
+  items: GraphNodeDetail["outgoing"];
+}) {
+  if (items.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+        {icon} {title} ({items.length})
+      </div>
+      <div className="flex flex-col gap-1.5">
+        {items.map((r, idx) => {
+          const label = r.relationType ?? r.type;
+          const closed = r.properties.validUntil !== null && r.properties.validUntil !== undefined && r.properties.validUntil !== "null";
+          return (
+            <div
+              key={`${r.other.id}-${idx}`}
+              className="rounded-md border bg-background px-2.5 py-2 flex items-center justify-between gap-2"
+            >
+              <div className="min-w-0 flex-1 flex flex-col gap-0.5">
+                <div className="text-[10px] uppercase font-medium tracking-wider text-muted-foreground">
+                  {label}
+                </div>
+                <div className="text-xs truncate">
+                  {r.other.name ?? r.other.id}
+                </div>
+              </div>
+              {closed ? (
+                <Badge variant="outline" className="text-[9px]">
+                  closed
+                </Badge>
+              ) : r.type === "FACT" ? (
+                <Badge variant="secondary" className="text-[9px]">
+                  open
+                </Badge>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/node-detail-sheet.tsx (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:12:48Z)**_
+
+Now the **retrieve panel**.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:13:08Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+"use client";
+
+import { useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Textarea } from "@/components/ui/textarea";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Separator } from "@/components/ui/separator";
+import { useSessions } from "@/components/providers/session-provider";
+import { api, type RetrievalResult } from "@/lib/api";
+import { Loader2, Search, ChevronDown, Sparkles } from "lucide-react";
+import { toast } from "sonner";
+import { cn } from "@/lib/utils";
+
+export function RetrievePanel() {
+  const { currentSessionId } = useSessions();
+  const [query, setQuery] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<RetrievalResult | null>(null);
+  const [factsOpen, setFactsOpen] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!currentSessionId) return;
+    const q = query.trim();
+    if (!q) return;
+    setBusy(true);
+    try {
+      const res = await api<RetrievalResult>("/retrieve", {
+        method: "POST",
+        body: { query: q, sessionId: currentSessionId, limit: 8 },
+      });
+      setResult(res);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Retrieval failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card className="h-full flex flex-col gap-0 overflow-hidden">
+      <CardHeader className="border-b">
+        <CardTitle className="text-sm font-medium tracking-wide uppercase text-muted-foreground">
+          Ask
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex-1 flex flex-col gap-3 overflow-hidden p-4">
+        <form onSubmit={handleSubmit} className="flex flex-col gap-2">
+          <Textarea
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Ask the memory anything. e.g. 'what does the user love?'"
+            disabled={busy || !currentSessionId}
+            rows={3}
+            className="resize-none"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                if (!busy && query.trim() && currentSessionId) {
+                  void handleSubmit(e as unknown as React.FormEvent);
+                }
+              }
+            }}
+          />
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-muted-foreground">
+              ⌘/Ctrl + Enter
+            </span>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={busy || !query.trim() || !currentSessionId}
+            >
+              {busy ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Search className="h-3.5 w-3.5" />
+              )}
+              {busy ? "Asking…" : "Ask"}
+            </Button>
+          </div>
+        </form>
+
+        <div className="flex-1 min-h-0 flex flex-col">
+          <ScrollArea className="flex-1 -mx-2 px-2">
+            {!result ? (
+              <div className="text-xs text-muted-foreground py-8 text-center border border-dashed rounded-md">
+                Answers will appear here. The system answers from its memory of this session.
+              </div>
+            ) : (
+              <div className="flex flex-col gap-4">
+                <div className="rounded-md border bg-muted/30 p-3 flex flex-col gap-2">
+                  <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+                    <Sparkles className="h-2.5 w-2.5" /> Answer
+                  </div>
+                  <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                    {result.answer}
+                  </p>
+                </div>
+
+                {result.facts.length > 0 ? (
+                  <Collapsible open={factsOpen} onOpenChange={setFactsOpen}>
+                    <CollapsibleTrigger asChild>
+                      <button className="flex items-center justify-between w-full text-left rounded-md hover:bg-muted/40 px-2 py-1.5 transition-colors">
+                        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                          Facts used ({result.facts.length})
+                        </span>
+                        <ChevronDown
+                          className={cn(
+                            "h-3.5 w-3.5 text-muted-foreground transition-transform",
+                            factsOpen && "rotate-180",
+                          )}
+                        />
+                      </button>
+                    </CollapsibleTrigger>
+                    <CollapsibleContent>
+                      <div className="flex flex-col gap-1.5 pt-2">
+                        {result.facts.map((f) => (
+                          <div
+                            key={f.factId}
+                            className="rounded-md border bg-background px-2.5 py-2 flex flex-col gap-1"
+                          >
+                            <div className="flex items-center gap-1.5 justify-between">
+                              <span className="text-[10px] font-medium tracking-wider uppercase text-muted-foreground">
+                                {f.sourceName} → {f.relationType} → {f.targetName}
+                              </span>
+                              <Badge variant="outline" className="text-[9px]">
+                                {(f.llmScore ?? f.totalScore).toFixed(2)}
+                              </Badge>
+                            </div>
+                            <p className="text-xs leading-snug">{f.factText}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </CollapsibleContent>
+                  </Collapsible>
+                ) : null}
+
+                {result.recentMessages.length > 0 ? (
+                  <div className="flex flex-col gap-2">
+                    <Separator />
+                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                      Conversation tail
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      {result.recentMessages.map((m, idx) => (
+                        <div
+                          key={idx}
+                          className="rounded-md bg-muted/20 px-2.5 py-1.5 text-xs leading-snug"
+                        >
+                          <span className="text-muted-foreground">[{m.actor}] </span>
+                          {m.content}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </ScrollArea>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/retrieve-panel.tsx (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:13:18Z)**_
+
+Now the **app shell** that ties it all together — sidebar + resizable 3-panel main area, with the "must log in + select session" gate.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:13:34Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+"use client";
+
+import { useCallback, useState } from "react";
+import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "@/components/ui/resizable";
+import { Separator } from "@/components/ui/separator";
+import { useAuth } from "@/components/providers/auth-provider";
+import { useSessions } from "@/components/providers/session-provider";
+import { SessionsSidebar } from "./sessions-sidebar";
+import { IngestPanel } from "./ingest-panel";
+import { GraphPanel } from "./graph-panel";
+import { RetrievePanel } from "./retrieve-panel";
+import { AuthScreen } from "@/components/auth/auth-screen";
+import { Button } from "@/components/ui/button";
+import { Plus, Loader2 } from "lucide-react";
+
+export function AppShell() {
+  const { user, loading: authLoading } = useAuth();
+  const [graphRefreshSignal, setGraphRefreshSignal] = useState(0);
+
+  const bumpGraph = useCallback(() => {
+    setGraphRefreshSignal((n) => n + 1);
+  }, []);
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <AuthScreen />;
+  }
+
+  return (
+    <SidebarProvider defaultOpen>
+      <SessionsSidebar />
+      <SidebarInset className="overflow-hidden">
+        <ShellHeader />
+        <Separator />
+        <MainArea
+          graphRefreshSignal={graphRefreshSignal}
+          onIngestProcessed={bumpGraph}
+        />
+      </SidebarInset>
+    </SidebarProvider>
+  );
+}
+
+function ShellHeader() {
+  const { sessions, currentSessionId } = useSessions();
+  const current = sessions.find((s) => s.id === currentSessionId);
+  return (
+    <header className="flex h-12 items-center gap-3 px-3 shrink-0">
+      <SidebarTrigger className="-ml-1" />
+      <Separator orientation="vertical" className="!h-4" />
+      <div className="flex flex-col leading-tight">
+        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          Session
+        </span>
+        <span className="text-sm font-medium truncate max-w-[280px]">
+          {current?.title?.trim() ||
+            (current ? "Untitled session" : "No session selected")}
+        </span>
+      </div>
+    </header>
+  );
+}
+
+function MainArea({
+  graphRefreshSignal,
+  onIngestProcessed,
+}: {
+  graphRefreshSignal: number;
+  onIngestProcessed: () => void;
+}) {
+  const { currentSessionId, sessions, createSession } = useSessions();
+  const [creating, setCreating] = useState(false);
+
+  if (!currentSessionId) {
+    return (
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="max-w-md w-full flex flex-col items-center gap-3 text-center">
+          <div className="text-sm text-muted-foreground">
+            {sessions.length === 0
+              ? "Welcome. Start by creating your first session."
+              : "Select a session from the sidebar or create a new one."}
+          </div>
+          <Button
+            onClick={async () => {
+              setCreating(true);
+              try {
+                await createSession();
+              } finally {
+                setCreating(false);
+              }
+            }}
+            disabled={creating}
+          >
+            <Plus className="h-3.5 w-3.5" />
+            {creating ? "Creating…" : "New session"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex-1 min-h-0 p-3">
+      <ResizablePanelGroup direction="horizontal" className="h-full">
+        <ResizablePanel defaultSize={22} minSize={16} maxSize={32}>
+          <IngestPanel onProcessed={onIngestProcessed} />
+        </ResizablePanel>
+        <ResizableHandle withHandle className="mx-1.5" />
+        <ResizablePanel defaultSize={52} minSize={30}>
+          <GraphPanel refreshSignal={graphRefreshSignal} />
+        </ResizablePanel>
+        <ResizableHandle withHandle className="mx-1.5" />
+        <ResizablePanel defaultSize={26} minSize={20} maxSize={36}>
+          <RetrievePanel />
+        </ResizablePanel>
+      </ResizablePanelGroup>
+    </div>
+  );
+}
+
+```
+
+```text
+File created successfully at: /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/app-shell.tsx (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:13:38Z)**_
+
+Now wire the providers into the root layout and replace the landing page with `AppShell`.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:15:29Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+import { AuthProvider } from "@/components/providers/auth-provider";
+import { SessionsProvider } from "@/components/providers/session-provider";
+import { Toaster } from "@/components/ui/sonner";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: "Zep Memory",
+  description: "Temporal knowledge-graph memory for agents.",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html
+      lang="en"
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+    >
+      <body className="min-h-full flex flex-col">
+        <AuthProvider>
+          <SessionsProvider>
+            {children}
+            <Toaster richColors position="top-right" />
+          </SessionsProvider>
+        </AuthProvider>
+      </body>
+    </html>
+  );
+}
+
+```
+
+```text
+<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:15:34Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./client/app/layout.tsx`
+
+```text
+1	import type { Metadata } from "next";
+2	import { Geist, Geist_Mono } from "next/font/google";
+3	import "./globals.css";
+4	
+5	const geistSans = Geist({
+6	  variable: "--font-geist-sans",
+7	  subsets: ["latin"],
+8	});
+9	
+10	const geistMono = Geist_Mono({
+11	  variable: "--font-geist-mono",
+12	  subsets: ["latin"],
+13	});
+14	
+15	export const metadata: Metadata = {
+16	  title: "Create Next App",
+17	  description: "Generated by create next app",
+18	};
+19	
+20	export default function RootLayout({
+21	  children,
+22	}: Readonly<{
+23	  children: React.ReactNode;
+24	}>) {
+25	  return (
+26	    <html
+27	      lang="en"
+28	      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+29	    >
+30	      <body className="min-h-full flex flex-col">{children}</body>
+31	    </html>
+32	  );
+33	}
+34
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:15:40Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+import { AuthProvider } from "@/components/providers/auth-provider";
+import { SessionsProvider } from "@/components/providers/session-provider";
+import { Toaster } from "@/components/ui/sonner";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: "Zep Memory",
+  description: "Temporal knowledge-graph memory for agents.",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html
+      lang="en"
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+    >
+      <body className="min-h-full flex flex-col">
+        <AuthProvider>
+          <SessionsProvider>
+            {children}
+            <Toaster richColors position="top-right" />
+          </SessionsProvider>
+        </AuthProvider>
+      </body>
+    </html>
+  );
+}
+
+```
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/app/layout.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:15:46Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+import { AppShell } from "@/components/app/app-shell";
+
+export default function Page() {
+  return <AppShell />;
+}
+
+```
+
+```text
+<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:15:50Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./client/app/page.tsx`
+
+```text
+1	import Image from "next/image";
+2	
+3	export default function Home() {
+4	  return (
+5	    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:15:58Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Write"><details>
+<summary>Tool use: **Write**</summary>
+
+```tsx
+import { AppShell } from "@/components/app/app-shell";
+
+export default function Page() {
+  return <AppShell />;
+}
+
+```
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:16:17Z)**_
+
+Add a couple of small style touches to `globals.css` for the React Flow integration with the theme system.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:16:17Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:16:23Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./client/app/globals.css`
+
+```text
+130	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:16:27Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./client/app/globals.css`
+
+```text
+115	  --sidebar-accent-foreground: oklch(0.985 0 0);
+116	  --sidebar-border: oklch(1 0 0 / 10%);
+117	  --sidebar-ring: oklch(0.556 0 0);
+118	}
+119	
+120	@layer base {
+121	  * {
+122	    @apply border-border outline-ring/50;
+123	  }
+124	  body {
+125	    @apply bg-background text-foreground;
+126	  }
+127	  html {
+128	    @apply font-sans;
+129	  }
+130	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:16:36Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/app/globals.css has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:16:46Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 17:16:46Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Check Toaster export
+
+`cat /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/ui/sonner.tsx`
+
+```text
+"use client"
+
+import { useTheme } from "next-themes"
+import { Toaster as Sonner, type ToasterProps } from "sonner"
+import { CircleCheckIcon, InfoIcon, TriangleAlertIcon, OctagonXIcon, Loader2Icon } from "lucide-react"
+
+const Toaster = ({ ...props }: ToasterProps) => {
+  const { theme = "system" } = useTheme()
+
+  return (
+    <Sonner
+      theme={theme as ToasterProps["theme"]}
+      className="toaster group"
+      icons={{
+        success: (
+          <CircleCheckIcon className="size-4" />
+        ),
+        info: (
+          <InfoIcon className="size-4" />
+        ),
+        warning: (
+          <TriangleAlertIcon className="size-4" />
+        ),
+        error: (
+          <OctagonXIcon className="size-4" />
+        ),
+        loading: (
+          <Loader2Icon className="size-4 animate-spin" />
+        ),
+      }}
+      style={
+        {
+          "--normal-bg": "var(--popover)",
+          "--normal-text": "var(--popover-foreground)",
+          "--normal-border": "var(--border)",
+          "--border-radius": "var(--radius)",
+        } as React.CSSProperties
+      }
+      toastOptions={{
+        classNames: {
+          toast: "cn-toast",
+        },
+      }}
+      {...props}
+    />
+  )
+}
+
+export { Toaster }
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:16:52Z)**_
+
+Good. Now let me try running the dev server briefly to catch any compile errors.
+
+_**Agent (claude-opus-4-7 2026-05-11 17:16:54Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Quick dev server start to check for compile errors
+
+`timeout 35 bun run dev 2>&1 | head -80`
+
+```text
+(eval):1: command not found: timeout
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:17:28Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Start Next dev, hit /, capture compile output, then kill
+
+```bash
+bun run dev > /tmp/next-dev.log 2>&1 &
+NEXTPID=$!
+sleep 18
+echo "--- log ---"
+cat /tmp/next-dev.log
+echo "--- /log ---"
+echo "---"
+echo "Hitting /..."
+curl -s -o /tmp/curl-out.html -w "HTTP %{http_code}\n" http://localhost:3000/ || true
+echo "--- new log lines ---"
+tail -40 /tmp/next-dev.log
+kill $NEXTPID 2>/dev/null
+wait 2>/dev/null
+echo "killed"
+```
+
+```text
+--- log ---
+$ next dev
+▲ Next.js 16.2.6 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://192.168.1.12:3000
+✓ Ready in 305ms
+
+--- /log ---
+---
+Hitting /...
+HTTP 200
+--- new log lines ---
+$ next dev
+▲ Next.js 16.2.6 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://192.168.1.12:3000
+✓ Ready in 305ms
+
+ GET / 200 in 1630ms (next.js: 1518ms, application-code: 112ms)
+killed
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-11 17:17:47Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-11 17:18:07Z)**_
+
+Compiled cleanly, served `/` in 200. Let me give you the run instructions.
+
+---
+
+## What was built
+
+**Backend (additive — zero changes to existing routes):**
+- `server/src/services/graph.service.ts` — `getUserGraph(userId, sessionId?)` and `getNodeDetail(userId, nodeId)`
+- `server/src/validators/graph.validator.ts`
+- `server/src/controllers/graph.controller.ts`
+- `server/src/routes/graph.routes.ts`
+- `server/src/index.ts` — mounted at `/graph` (protected)
+
+Two new endpoints, both auth-gated:
+- `GET /graph?sessionId=...` → `{ entities[], facts[], episodes[], mentions[] }`
+- `GET /graph/node/:id` → `{ kind, properties, outgoing[], incoming[] }`
+
+**Frontend (Next.js 16 + Tailwind 4 + shadcn + React Flow):**
+
+```
+client/
+├── app/
+│   ├── layout.tsx              — wraps in AuthProvider + SessionsProvider + Toaster
+│   ├── page.tsx                — renders <AppShell />
+│   └── globals.css             — added React Flow theme glue
+├── lib/
+│   ├── api.ts                  — fetcher (Bearer JWT, auto-clears on 401)
+│   ├── graph-layout.ts         — dagre auto-layout for React Flow
+│   └── utils.ts                — (existing)
+└── components/
+    ├── providers/
+    │   ├── auth-provider.tsx   — login/signup/logout, localStorage-backed
+    │   └── session-provider.tsx — sessions list + currentSessionId persistence
+    ├── auth/
+    │   └── auth-screen.tsx     — single screen, toggle login ⇄ signup
+    └── app/
+        ├── app-shell.tsx       — gate + sidebar + 3-panel layout
+        ├── sessions-sidebar.tsx — retractable sidebar (sessions + user menu)
+        ├── ingest-panel.tsx    — textarea + polled status badges
+        ├── graph-panel.tsx     — React Flow viz w/ closed/episode toggles
+        ├── retrieve-panel.tsx  — answer + collapsible facts + conversation tail
+        └── node-detail-sheet.tsx — slide-in details on node click
+```
+
+## How to run
+
+```bash
+# terminal 1 — backend API
+cd server && bun run dev
+
+# terminal 2 — worker
+cd server && bun run worker
+
+# terminal 3 — frontend
+cd client && bun run dev
+# → http://localhost:3000
+```
+
+The frontend defaults to `http://localhost:3002` for the API. Set `NEXT_PUBLIC_API_URL` in `client/.env.local` to override.
+
+## UX flow
+
+1. Land on `/` → if no JWT in localStorage, **AuthScreen** shows (sign in / sign up toggle).
+2. After auth → sidebar appears with sessions list, but the main area says "create your first session." Click → modal → enter optional title → session created and selected.
+3. Once a session is active, the 3 resizable panels light up:
+   - **Left — Ingest.** Textarea + Send. Each message appears in the "Recent" list with a live status badge: `queued` → `processing` → `processed`. Polling at 1.5s intervals (`GET /episodes/:id`); the moment it flips to `processed`, the graph refreshes automatically.
+   - **Middle — Graph.** Auto-laid-out with dagre. Entity nodes colored by type (PERSON / COMPANY / LOCATION / CONCEPT / PRODUCT / DATE / OTHER). The user's self-entity has a dashed border. Episode nodes are wider with content snippet + timestamp. Closed FACT edges are dashed and dimmed. Toggles in the header: show closed facts on/off, show episodes on/off. Click any node → opens the **detail sheet** with full properties, outgoing/incoming relationships, and open/closed badges per edge.
+   - **Right — Ask.** Query input → `POST /retrieve` → `answer` shown prominently, then a collapsible "Facts used" list with relevance scores, then the conversation tail.
+4. Cmd/Ctrl + Enter submits in both Ingest and Ask textareas.
+5. Sidebar retracts via the trigger in the header bar.
+
+## Polish details
+
+- Monochrome palette with subtle colored accents only on entity-type chips. No gradients.
+- Self-entity rendered with a dashed border to visually distinguish from extracted entities (addresses the "Kevin vs User" confusion you ran into).
+- Closed facts: dashed gray edge + 0.55 opacity — agent-readable at a glance.
+- Each panel is a `Card` with a tight border-bottom header; consistent typography (uppercase-tracking labels, `text-xs/sm` body).
+- `Skeleton` placeholders during initial loads; `Loader2` spinners during in-flight ops.
+- Toast on failures (sonner, top-right).
+- Mobile/narrow-screen behavior: resizable panels still work; the sidebar collapses to a slide-over sheet via shadcn's mobile sidebar logic.
+
+## What it does NOT do (deferred)
+
+- **No WebSocket / SSE** — polling on `GET /episodes/:id` only while messages are in flight. Stops as soon as status is `processed`. No idle traffic.
+- **No graph time-travel UI** — the backend `asOf` param exists on `/retrieve`, but I didn't add a date picker for the graph view (would be a nice next step).
+- **No node deletion / editing** — read-only graph.
+- **No history of asked questions** — each Ask replaces the previous answer in the panel.
+
+## Existing functionality preserved
+
+I verified the diff carefully — only **additive** changes:
+- `server/src/index.ts` got 2 new lines (import + `protectedRoutes.route("/graph", ...)`)
+- 4 new files in `server/src/{services,validators,controllers,routes}/graph.*`
+- Zero changes to extraction, resolver, temporal, retrieval, ingestion, worker, or any existing route handler.
+
+Hit `bun run dev` in the client folder and you should see the full app boot. If anything breaks at runtime, paste the browser console / server log and I'll fix.
+
+---
+
+_**User (2026-05-12 16:34:56Z)**_
+
+Runtime Error
+
+
+
+`Tooltip` must be used within `TooltipProvider`
+components/ui/tooltip.tsx (24:10) @ Tooltip
+
+
+  22 |   ...props
+  23 | }: React.ComponentProps<typeof TooltipPrimitive.Root>) {
+> 24 |   return <TooltipPrimitive.Root data-slot="tooltip" {...props} />
+     |          ^
+  25 | }
+  26 |
+  27 | function TooltipTrigger({
+Call Stack
+20
+
+Show 13 ignore-listed frame(s)
+Tooltip
+components/ui/tooltip.tsx (24:10)
+SidebarMenuButton
+components/ui/sidebar.tsx (528:5)
+<unknown>
+components/app/sessions-sidebar.tsx (150:23)
+Array.map
+<anonymous>
+SessionsSidebar
+components/app/sessions-sidebar.tsx (145:26)
+AppShell
+components/app/app-shell.tsx (43:7)
+Page
+app/page.tsx (4:10)➜  zep-paper-implementation git:(main) ✗ cd client
+➜  client git:(main) ✗ bun run dev
+$ next dev
+▲ Next.js 16.2.6 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://192.168.1.12:3000
+✓ Ready in 261ms
+
+ GET / 200 in 2.9s (next.js: 2.7s, application-code: 132ms)
+[browser] Uncaught Error: `Tooltip` must be used within `TooltipProvider`
+    at Tooltip (components/ui/tooltip.tsx:24:10)
+    at SidebarMenuButton (components/ui/sidebar.tsx:528:5)
+    at <unknown> (components/app/sessions-sidebar.tsx:150:23)
+    at Array.map (<anonymous>)
+    at SessionsSidebar (components/app/sessions-sidebar.tsx:145:26)
+    at AppShell (components/app/app-shell.tsx:43:7)
+    at Page (app/page.tsx:4:10)
+  22 |   ...props
+  23 | }: React.ComponentProps<typeof TooltipPrimitive.Root>) {
+> 24 |   return <TooltipPrimitive.Root data-slot="tooltip" {...props} />
+     |          ^
+  25 | }
+  26 |
+  27 | function TooltipTrigger({
+
+
+
+
+
+
+ see please fix this
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-12 16:35:17Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:35:18Z)**_
+
+`SidebarMenuButton` uses tooltips when collapsed and needs `TooltipProvider` higher up. Adding it to the layout.
+
+_**Agent (claude-opus-4-7 2026-05-12 16:35:22Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/app/layout.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:35:30Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/app/layout.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:35:36Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Confirm TooltipProvider is exported
+
+`grep -n "export" /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/ui/tooltip.tsx | head -5`
+
+```text
+57:export { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger }
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:35:43Z)**_
+
+Confirmed `TooltipProvider` exists. Reload your browser — the runtime error should be gone. The provider wraps everything inside the auth/sessions providers so any shadcn component that uses tooltips (sidebar buttons in collapsed state, etc.) finds the context.
+
+---
+
+_**User (2026-05-12 16:36:54Z)**_
+
+the graph is beautiful but the ingestion and retrieved panel are not resizable man,i cant see them at all
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-12 16:37:19Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:37:19Z)**_
+
+Let me check the SidebarInset structure to see why height isn't propagating.
+
+_**Agent (claude-opus-4-7 2026-05-12 16:37:20Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./client/components/ui/sidebar.tsx`
+
+```text
+300	    />
+301	  )
+302	}
+303	
+304	function SidebarInset({ className, ...props }: React.ComponentProps<"main">) {
+305	  return (
+306	    <main
+307	      data-slot="sidebar-inset"
+308	      className={cn(
+309	        "relative flex w-full flex-1 flex-col bg-background md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-xl md:peer-data-[variant=inset]:shadow-sm md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-2",
+310	        className
+311	      )}
+312	      {...props}
+313	    />
+314	  )
+315	}
+316	
+317	function SidebarInput({
+318	  className,
+319	  ...props
+320	}: React.ComponentProps<typeof Input>) {
+321	  return (
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:37:27Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:37:28Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./client/components/ui/sidebar.tsx`
+
+```text
+55	function SidebarProvider({
+56	  defaultOpen = true,
+57	  open: openProp,
+58	  onOpenChange: setOpenProp,
+59	  className,
+60	  style,
+61	  children,
+62	  ...props
+63	}: React.ComponentProps<"div"> & {
+64	  defaultOpen?: boolean
+65	  open?: boolean
+66	  onOpenChange?: (open: boolean) => void
+67	}) {
+68	  const isMobile = useIsMobile()
+69	  const [openMobile, setOpenMobile] = React.useState(false)
+70	
+71	  // This is the internal state of the sidebar.
+72	  // We use openProp and setOpenProp for control from outside the component.
+73	  const [_open, _setOpen] = React.useState(defaultOpen)
+74	  const open = openProp ?? _open
+75	  const setOpen = React.useCallback(
+76	    (value: boolean | ((value: boolean) => boolean)) => {
+77	      const openState = typeof value === "function" ? value(open) : value
+78	      if (setOpenProp) {
+79	        setOpenProp(openState)
+80	      } else {
+81	        _setOpen(openState)
+82	      }
+83	
+84	      // This sets the cookie to keep the sidebar state.
+85	      document.cookie = `${SIDEBAR_COOKIE_NAME}=${openState}; path=/; max-age=${SIDEBAR_COOKIE_MAX_AGE}`
+86	    },
+87	    [setOpenProp, open]
+88	  )
+89	
+90	  // Helper to toggle the sidebar.
+91	  const toggleSidebar = React.useCallback(() => {
+92	    return isMobile ? setOpenMobile((open) => !open) : setOpen((open) => !open)
+93	  }, [isMobile, setOpen, setOpenMobile])
+94	
+95	  // Adds a keyboard shortcut to toggle the sidebar.
+96	  React.useEffect(() => {
+97	    const handleKeyDown = (event: KeyboardEvent) => {
+98	      if (
+99	        event.key === SIDEBAR_KEYBOARD_SHORTCUT &&
+100	        (event.metaKey || event.ctrlKey)
+101	      ) {
+102	        event.preventDefault()
+103	        toggleSidebar()
+104	      }
+105	    }
+106	
+107	    window.addEventListener("keydown", handleKeyDown)
+108	    return () => window.removeEventListener("keydown", handleKeyDown)
+109	  }, [toggleSidebar])
+110	
+111	  // We add a state so that we can do data-state="expanded" or "collapsed".
+112	  // This makes it easier to style the sidebar with Tailwind classes.
+113	  const state = open ? "expanded" : "collapsed"
+114	
+115	  const contextValue = React.useMemo<SidebarContextProps>(
+116	    () => ({
+117	      state,
+118	      open,
+119	      setOpen,
+120	      isMobile,
+121	      openMobile,
+122	      setOpenMobile,
+123	      toggleSidebar,
+124	    }),
+125	    [state, open, setOpen, isMobile, openMobile, setOpenMobile, toggleSidebar]
+126	  )
+127	
+128	  return (
+129	    <SidebarContext.Provider value={contextValue}>
+130	      <div
+131	        data-slot="sidebar-wrapper"
+132	        style={
+133	          {
+134	            "--sidebar-width": SIDEBAR_WIDTH,
+135	            "--sidebar-width-icon": SIDEBAR_WIDTH_ICON,
+136	            ...style,
+137	          } as React.CSSProperties
+138	        }
+139	        className={cn(
+140	          "group/sidebar-wrapper flex min-h-svh w-full has-data-[variant=inset]:bg-sidebar",
+141	          className
+142	        )}
+143	        {...props}
+144	      >
+145	        {children}
+146	      </div>
+147	    </SidebarContext.Provider>
+148	  )
+149	}
+150	
+151	function Sidebar({
+152	  side = "left",
+153	  variant = "sidebar",
+154	  collapsible = "offcanvas",
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:37:44Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:37:45Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Check resizable component
+
+`cat /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/ui/resizable.tsx`
+
+```text
+"use client"
+
+import * as ResizablePrimitive from "react-resizable-panels"
+
+import { cn } from "@/lib/utils"
+
+function ResizablePanelGroup({
+  className,
+  ...props
+}: ResizablePrimitive.GroupProps) {
+  return (
+    <ResizablePrimitive.Group
+      data-slot="resizable-panel-group"
+      className={cn(
+        "flex h-full w-full aria-[orientation=vertical]:flex-col",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function ResizablePanel({ ...props }: ResizablePrimitive.PanelProps) {
+  return <ResizablePrimitive.Panel data-slot="resizable-panel" {...props} />
+}
+
+function ResizableHandle({
+  withHandle,
+  className,
+  ...props
+}: ResizablePrimitive.SeparatorProps & {
+  withHandle?: boolean
+}) {
+  return (
+    <ResizablePrimitive.Separator
+      data-slot="resizable-handle"
+      className={cn(
+        "relative flex w-px items-center justify-center bg-border ring-offset-background after:absolute after:inset-y-0 after:left-1/2 after:w-1 after:-translate-x-1/2 focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-hidden aria-[orientation=horizontal]:h-px aria-[orientation=horizontal]:w-full aria-[orientation=horizontal]:after:left-0 aria-[orientation=horizontal]:after:h-1 aria-[orientation=horizontal]:after:w-full aria-[orientation=horizontal]:after:translate-x-0 aria-[orientation=horizontal]:after:-translate-y-1/2 [&[aria-orientation=horizontal]>div]:rotate-90",
+        className
+      )}
+      {...props}
+    >
+      {withHandle && (
+        <div className="z-10 flex h-6 w-1 shrink-0 rounded-lg bg-border" />
+      )}
+    </ResizablePrimitive.Separator>
+  )
+}
+
+export { ResizableHandle, ResizablePanel, ResizablePanelGroup }
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:38:02Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:38:03Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Check Card component
+
+`cat /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/ui/card.tsx`
+
+```text
+import * as React from "react"
+
+import { cn } from "@/lib/utils"
+
+function Card({
+  className,
+  size = "default",
+  ...props
+}: React.ComponentProps<"div"> & { size?: "default" | "sm" }) {
+  return (
+    <div
+      data-slot="card"
+      data-size={size}
+      className={cn(
+        "group/card flex flex-col gap-4 overflow-hidden rounded-xl bg-card py-4 text-sm text-card-foreground ring-1 ring-foreground/10 has-data-[slot=card-footer]:pb-0 has-[>img:first-child]:pt-0 data-[size=sm]:gap-3 data-[size=sm]:py-3 data-[size=sm]:has-data-[slot=card-footer]:pb-0 *:[img:first-child]:rounded-t-xl *:[img:last-child]:rounded-b-xl",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function CardHeader({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-header"
+      className={cn(
+        "group/card-header @container/card-header grid auto-rows-min items-start gap-1 rounded-t-xl px-4 group-data-[size=sm]/card:px-3 has-data-[slot=card-action]:grid-cols-[1fr_auto] has-data-[slot=card-description]:grid-rows-[auto_auto] [.border-b]:pb-4 group-data-[size=sm]/card:[.border-b]:pb-3",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function CardTitle({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-title"
+      className={cn(
+        "font-heading text-base leading-snug font-medium group-data-[size=sm]/card:text-sm",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function CardDescription({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-description"
+      className={cn("text-sm text-muted-foreground", className)}
+      {...props}
+    />
+  )
+}
+
+function CardAction({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-action"
+      className={cn(
+        "col-start-2 row-span-2 row-start-1 self-start justify-self-end",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function CardContent({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-content"
+      className={cn("px-4 group-data-[size=sm]/card:px-3", className)}
+      {...props}
+    />
+  )
+}
+
+function CardFooter({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-footer"
+      className={cn(
+        "flex items-center rounded-b-xl border-t bg-muted/50 p-4 group-data-[size=sm]/card:p-3",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+export {
+  Card,
+  CardHeader,
+  CardFooter,
+  CardTitle,
+  CardAction,
+  CardDescription,
+  CardContent,
+}
+```
+</details></tool-use>
+
+---
+
+_**User (2026-05-12 16:38:42Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-05-12 16:38:46Z)**_
+
+please continue
+
+---
+
+_**Agent (claude-opus-4-7 2026-05-12 16:39:28Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:39:30Z)**_
+
+I think the height isn't propagating through the flex chain. Going to anchor it explicitly with viewport height + overflow-hidden so the resizable panels have something definite to size against.
+
+_**Agent (claude-opus-4-7 2026-05-12 16:39:30Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./client/components/app/app-shell.tsx`
+
+```text
+1	"use client";
+2	
+3	import { useCallback, useState } from "react";
+4	import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+5	import {
+6	  ResizableHandle,
+7	  ResizablePanel,
+8	  ResizablePanelGroup,
+9	} from "@/components/ui/resizable";
+10	import { Separator } from "@/components/ui/separator";
+11	import { useAuth } from "@/components/providers/auth-provider";
+12	import { useSessions } from "@/components/providers/session-provider";
+13	import { SessionsSidebar } from "./sessions-sidebar";
+14	import { IngestPanel } from "./ingest-panel";
+15	import { GraphPanel } from "./graph-panel";
+16	import { RetrievePanel } from "./retrieve-panel";
+17	import { AuthScreen } from "@/components/auth/auth-screen";
+18	import { Button } from "@/components/ui/button";
+19	import { Plus, Loader2 } from "lucide-react";
+20	
+21	export function AppShell() {
+22	  const { user, loading: authLoading } = useAuth();
+23	  const [graphRefreshSignal, setGraphRefreshSignal] = useState(0);
+24	
+25	  const bumpGraph = useCallback(() => {
+26	    setGraphRefreshSignal((n) => n + 1);
+27	  }, []);
+28	
+29	  if (authLoading) {
+30	    return (
+31	      <div className="min-h-screen flex items-center justify-center">
+32	        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+33	      </div>
+34	    );
+35	  }
+36	
+37	  if (!user) {
+38	    return <AuthScreen />;
+39	  }
+40	
+41	  return (
+42	    <SidebarProvider defaultOpen>
+43	      <SessionsSidebar />
+44	      <SidebarInset className="overflow-hidden">
+45	        <ShellHeader />
+46	        <Separator />
+47	        <MainArea
+48	          graphRefreshSignal={graphRefreshSignal}
+49	          onIngestProcessed={bumpGraph}
+50	        />
+51	      </SidebarInset>
+52	    </SidebarProvider>
+53	  );
+54	}
+55	
+56	function ShellHeader() {
+57	  const { sessions, currentSessionId } = useSessions();
+58	  const current = sessions.find((s) => s.id === currentSessionId);
+59	  return (
+60	    <header className="flex h-12 items-center gap-3 px-3 shrink-0">
+61	      <SidebarTrigger className="-ml-1" />
+62	      <Separator orientation="vertical" className="!h-4" />
+63	      <div className="flex flex-col leading-tight">
+64	        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+65	          Session
+66	        </span>
+67	        <span className="text-sm font-medium truncate max-w-[280px]">
+68	          {current?.title?.trim() ||
+69	            (current ? "Untitled session" : "No session selected")}
+70	        </span>
+71	      </div>
+72	    </header>
+73	  );
+74	}
+75	
+76	function MainArea({
+77	  graphRefreshSignal,
+78	  onIngestProcessed,
+79	}: {
+80	  graphRefreshSignal: number;
+81	  onIngestProcessed: () => void;
+82	}) {
+83	  const { currentSessionId, sessions, createSession } = useSessions();
+84	  const [creating, setCreating] = useState(false);
+85	
+86	  if (!currentSessionId) {
+87	    return (
+88	      <div className="flex-1 flex items-center justify-center p-8">
+89	        <div className="max-w-md w-full flex flex-col items-center gap-3 text-center">
+90	          <div className="text-sm text-muted-foreground">
+91	            {sessions.length === 0
+92	              ? "Welcome. Start by creating your first session."
+93	              : "Select a session from the sidebar or create a new one."}
+94	          </div>
+95	          <Button
+96	            onClick={async () => {
+97	              setCreating(true);
+98	              try {
+99	                await createSession();
+100	              } finally {
+101	                setCreating(false);
+102	              }
+103	            }}
+104	            disabled={creating}
+105	          >
+106	            <Plus className="h-3.5 w-3.5" />
+107	            {creating ? "Creating…" : "New session"}
+108	          </Button>
+109	        </div>
+110	      </div>
+111	    );
+112	  }
+113	
+114	  return (
+115	    <div className="flex-1 min-h-0 p-3">
+116	      <ResizablePanelGroup direction="horizontal" className="h-full">
+117	        <ResizablePanel defaultSize={22} minSize={16} maxSize={32}>
+118	          <IngestPanel onProcessed={onIngestProcessed} />
+119	        </ResizablePanel>
+120	        <ResizableHandle withHandle className="mx-1.5" />
+121	        <ResizablePanel defaultSize={52} minSize={30}>
+122	          <GraphPanel refreshSignal={graphRefreshSignal} />
+123	        </ResizablePanel>
+124	        <ResizableHandle withHandle className="mx-1.5" />
+125	        <ResizablePanel defaultSize={26} minSize={20} maxSize={36}>
+126	          <RetrievePanel />
+127	        </ResizablePanel>
+128	      </ResizablePanelGroup>
+129	    </div>
+130	  );
+131	}
+132
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:40:07Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:40:08Z)**_
+
+Going to refactor the layout with explicit grid sizing — that always gives `react-resizable-panels` a definite height to work against. The `flex-1 + min-h-0` chain is brittle when Turbopack and Tailwind 4 are involved.
+
+_**Agent (claude-opus-4-7 2026-05-12 16:40:19Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/app-shell.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:40:33Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/app-shell.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:40:41Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:40:59Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Re-run dev server to confirm no new compile errors
+
+```bash
+cd /Users/karthiknadar/Desktop/zep-paper-implementation/client && bun run dev > /tmp/next-dev.log 2>&1 &
+NEXTPID=$!
+sleep 12
+curl -s -o /tmp/curl-out.html -w "HTTP %{http_code}\n" http://localhost:3000/
+echo "--- log ---"
+cat /tmp/next-dev.log
+kill $NEXTPID 2>/dev/null
+wait 2>/dev/null
+```
+
+```text
+HTTP 200
+--- log ---
+$ next dev
+⚠ Port 3000 is in use by process 75051, using available port 3001 instead.
+▲ Next.js 16.2.6 (Turbopack)
+- Local:         http://localhost:3001
+- Network:       http://192.168.1.12:3001
+✓ Ready in 313ms
+⨯ Another next dev server is already running.
+
+- Local:        http://localhost:3000
+- PID:          75051
+- Dir:          /Users/karthiknadar/Desktop/zep-paper-implementation/client
+- Log:          .next/dev/logs/next-development.log
+
+Run kill 75051 to stop it.
+[?25h
+error: script "dev" exited with code 1
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:41:12Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:41:13Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Find PanelGroup type definition
+
+```bash
+grep -n "direction\|GroupProps" /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/declarations/src/PanelGroup.d.ts 2>/dev/null | head -20
+echo "---"
+ls /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/declarations/src/ 2>&1 | head -20
+```
+
+```text
+---
+ls: /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/declarations/src/: No such file or directory
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:41:19Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Find react-resizable-panels types
+
+```bash
+find /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels -name "*.d.ts" 2>/dev/null | head -5
+echo "---"
+grep -rn "GroupProps\|PanelGroupProps" /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/*.d.ts 2>/dev/null | head -15
+```
+
+```text
+/Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.d.ts
+---
+/Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.d.ts:26:export declare function Group({ children, className, defaultLayout, disableCursor, disabled, elementRef: elementRefProp, groupRef, id: idProp, onLayoutChange: onLayoutChangeUnstable, onLayoutChanged: onLayoutChangedUnstable, orientation, resizeTargetMinimumSize, style, ...rest }: GroupProps): JSX.Element;
+/Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.d.ts:57:export declare type GroupProps = HTMLAttributes<HTMLDivElement> & {
+/Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.d.ts:158:export declare type OnGroupLayoutChange = GroupProps["onLayoutChange"];
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:41:24Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Read GroupProps type
+
+`sed -n '55,80p' /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.d.ts`
+
+```text
+}
+
+export declare type GroupProps = HTMLAttributes<HTMLDivElement> & {
+    /**
+     * Panel and Separator components that comprise this group.
+     */
+    children?: ReactNode | undefined;
+    /**
+     * CSS class name.
+     */
+    className?: string | undefined;
+    /**
+     * Default layout for the Group.
+     *
+     * ℹ️ This value allows layouts to be remembered between page reloads.
+     *
+     * ⚠️ Slight layout shift may occur when server-rendering panels with percentage-based default sizes.
+     * Refer to the documentation for suggestions on how to minimize the impact of this.
+     */
+    defaultLayout?: Layout | undefined;
+    /**
+     * This library sets custom mouse cursor styles to indicate drag state.
+     * Use this prop to disable that behavior for Panels and Separators in this group.
+     */
+    disableCursor?: boolean | undefined;
+    /**
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:41:40Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:41:40Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Check orientation default
+
+`grep -n "orientation" /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.d.ts | head -20`
+
+```text
+26:export declare function Group({ children, className, defaultLayout, disableCursor, disabled, elementRef: elementRefProp, groupRef, id: idProp, onLayoutChange: onLayoutChangeUnstable, onLayoutChanged: onLayoutChangedUnstable, orientation, resizeTargetMinimumSize, style, ...rest }: GroupProps): JSX.Element;
+133:     * Specifies the resizable orientation ("horizontal" or "vertical"); defaults to "horizontal"
+135:    orientation?: "horizontal" | "vertical" | undefined;
+163: * Panel group orientation loosely relates to the `aria-orientation` attribute.
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:42:03Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:42:05Z)**_
+
+Found it. **`direction` is the old v3 prop name; v4 uses `orientation`.** That was silently ignored. Also fixing the Tailwind 4 important-modifier syntax.
+
+_**Agent (claude-opus-4-7 2026-05-12 16:42:18Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/app-shell.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:42:43Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:42:43Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Check mobile breakpoint
+
+`cat /Users/karthiknadar/Desktop/zep-paper-implementation/client/hooks/use-mobile.ts`
+
+```text
+import * as React from "react"
+
+const MOBILE_BREAKPOINT = 768
+
+export function useIsMobile() {
+  const [isMobile, setIsMobile] = React.useState<boolean | undefined>(undefined)
+
+  React.useEffect(() => {
+    const mql = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`)
+    const onChange = () => {
+      setIsMobile(window.innerWidth < MOBILE_BREAKPOINT)
+    }
+    mql.addEventListener("change", onChange)
+    setIsMobile(window.innerWidth < MOBILE_BREAKPOINT)
+    return () => mql.removeEventListener("change", onChange)
+  }, [])
+
+  return !!isMobile
+}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:42:53Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:42:54Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+List react-resizable-panels exports
+
+`grep -E "^export (declare )?(function|const|type|interface)" /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.d.ts | head -30`
+
+```text
+export declare function Group({ children, className, defaultLayout, disableCursor, disabled, elementRef: elementRefProp, groupRef, id: idProp, onLayoutChange: onLayoutChangeUnstable, onLayoutChanged: onLayoutChangedUnstable, orientation, resizeTargetMinimumSize, style, ...rest }: GroupProps): JSX.Element;
+export declare interface GroupImperativeHandle {
+export declare type GroupProps = HTMLAttributes<HTMLDivElement> & {
+export declare function isCoarsePointer(): boolean;
+export declare type Layout = {
+export declare type LayoutStorage = Pick<Storage, "getItem" | "setItem">;
+export declare type OnGroupLayoutChange = GroupProps["onLayoutChange"];
+export declare type OnPanelResize = PanelProps["onResize"];
+export declare type Orientation = "horizontal" | "vertical";
+export declare function Panel({ children, className, collapsedSize, collapsible, defaultSize, disabled, elementRef: elementRefProp, groupResizeBehavior, id: idProp, maxSize, minSize, onResize: onResizeUnstable, panelRef, style, ...rest }: PanelProps): JSX.Element;
+export declare interface PanelImperativeHandle {
+export declare type PanelProps = BasePanelAttributes & {
+export declare type PanelSize = {
+export declare function Separator({ children, className, disabled, disableDoubleClick, elementRef: elementRefProp, id: idProp, style, ...rest }: SeparatorProps): JSX.Element;
+export declare type SeparatorProps = BaseSeparatorAttributes & {
+export declare type SizeUnit = "px" | "%" | "em" | "rem" | "vh" | "vw";
+export declare function useDefaultLayout({ debounceSaveMs, panelIds, storage, ...rest }: {
+export declare function useGroupCallbackRef(): [GroupImperativeHandle | null, Dispatch<SetStateAction<GroupImperativeHandle | null>>];
+export declare function useGroupRef(): RefObject<GroupImperativeHandle | null>;
+export declare function usePanelCallbackRef(): [PanelImperativeHandle | null, Dispatch<SetStateAction<PanelImperativeHandle | null>>];
+export declare function usePanelRef(): RefObject<PanelImperativeHandle | null>;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:43:04Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:43:04Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Check Panel props
+
+`grep -A 40 "PanelProps =" /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.d.ts | head -50`
+
+```text
+export declare type PanelProps = BasePanelAttributes & {
+    /**
+     * CSS class name.
+     *
+     * ⚠️ Class is applied to nested `HTMLDivElement` to avoid styles that interfere with Flex layout.
+     */
+    className?: string | undefined;
+    /**
+     * Panel size when collapsed; defaults to 0%.
+     */
+    collapsedSize?: number | string | undefined;
+    /**
+     * This panel can be collapsed.
+     *
+     * ℹ️ A collapsible panel will collapse when it's size is less than of the specified `minSize`
+     */
+    collapsible?: boolean | undefined;
+    /**
+     * Default size of Panel within its parent group; default is auto-assigned based on the total number of Panels.
+     *
+     * ⚠️ Percentage based sizes may cause slight layout shift when server-rendering.
+     * For more information see the documentation.
+     */
+    defaultSize?: number | string | undefined;
+    /**
+     * When disabled, a panel cannot be resized either directly or indirectly (by resizing another panel).
+     */
+    disabled?: boolean | undefined;
+    /**
+     * Ref attached to the root `HTMLDivElement`.
+     */
+    elementRef?: Ref<HTMLDivElement | null> | undefined;
+    /**
+     * How should this Panel behave if the parent Group is resized?
+     * Defaults to `preserve-relative-size`.
+     *
+     * - `preserve-relative-size`: Retain the current relative size (as a percentage of the Group)
+     * - `preserve-pixel-size`: Retain its current size (in pixels)
+     *
+     * ℹ️ Panel min/max size constraints may impact this behavior.
+     *
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:43:10Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:43:11Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Look at Panel's JSX
+
+`grep -B 2 -A 20 "function Panel" /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.js 2>/dev/null | head -50`
+
+```text
+(Bash completed with no output)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:43:17Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Inspect built file
+
+```bash
+ls /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/ 2>&1
+echo "---"
+grep -E "outerStyle|innerStyle|Panel\(" /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.mjs 2>/dev/null | head -20
+```
+
+```text
+react-resizable-panels.cjs
+react-resizable-panels.cjs.map
+react-resizable-panels.d.ts
+react-resizable-panels.js
+react-resizable-panels.js.map
+---
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:43:23Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Quick check on bundle structure
+
+```bash
+grep -E "jsx\(\"div\"" /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.js 2>/dev/null | head -5
+echo "---"
+wc -l /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.js
+```
+
+```text
+---
+    2211 /Users/karthiknadar/Desktop/zep-paper-implementation/client/node_modules/react-resizable-panels/dist/react-resizable-panels.js
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:43:37Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:43:38Z)**_
+
+The `grid grid-rows-[...]` I added conflicts with shadcn's built-in `flex flex-col` on `SidebarInset`. Let me simplify — just lock the height with `h-svh` and let the existing flex-col do its work.
+
+_**Agent (claude-opus-4-7 2026-05-12 16:43:55Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/app-shell.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:44:17Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/app-shell.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:44:22Z)**_
+
+Now let me verify the file compiles cleanly:
+
+_**Agent (claude-opus-4-7 2026-05-12 16:44:22Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./client/components/app/app-shell.tsx`
+
+```text
+1	"use client";
+2	
+3	import { useCallback, useState } from "react";
+4	import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+5	import {
+6	  ResizableHandle,
+7	  ResizablePanel,
+8	  ResizablePanelGroup,
+9	} from "@/components/ui/resizable";
+10	import { Separator } from "@/components/ui/separator";
+11	import { useAuth } from "@/components/providers/auth-provider";
+12	import { useSessions } from "@/components/providers/session-provider";
+13	import { SessionsSidebar } from "./sessions-sidebar";
+14	import { IngestPanel } from "./ingest-panel";
+15	import { GraphPanel } from "./graph-panel";
+16	import { RetrievePanel } from "./retrieve-panel";
+17	import { AuthScreen } from "@/components/auth/auth-screen";
+18	import { Button } from "@/components/ui/button";
+19	import { Plus, Loader2 } from "lucide-react";
+20	
+21	export function AppShell() {
+22	  const { user, loading: authLoading } = useAuth();
+23	  const [graphRefreshSignal, setGraphRefreshSignal] = useState(0);
+24	
+25	  const bumpGraph = useCallback(() => {
+26	    setGraphRefreshSignal((n) => n + 1);
+27	  }, []);
+28	
+29	  if (authLoading) {
+30	    return (
+31	      <div className="min-h-screen flex items-center justify-center">
+32	        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+33	      </div>
+34	    );
+35	  }
+36	
+37	  if (!user) {
+38	    return <AuthScreen />;
+39	  }
+40	
+41	  return (
+42	    <SidebarProvider defaultOpen>
+43	      <SessionsSidebar />
+44	      <SidebarInset className="h-svh overflow-hidden">
+45	        <ShellHeader />
+46	        <Separator />
+47	        <MainArea
+48	          graphRefreshSignal={graphRefreshSignal}
+49	          onIngestProcessed={bumpGraph}
+50	        />
+51	      </SidebarInset>
+52	    </SidebarProvider>
+53	  );
+54	}
+55	
+56	function ShellHeader() {
+57	  const { sessions, currentSessionId } = useSessions();
+58	  const current = sessions.find((s) => s.id === currentSessionId);
+59	  return (
+60	    <header className="flex h-12 items-center gap-3 px-3 shrink-0">
+61	      <SidebarTrigger className="-ml-1" />
+62	      <Separator orientation="vertical" className="!h-4" />
+63	      <div className="flex flex-col leading-tight">
+64	        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+65	          Session
+66	        </span>
+67	        <span className="text-sm font-medium truncate max-w-[280px]">
+68	          {current?.title?.trim() ||
+69	            (current ? "Untitled session" : "No session selected")}
+70	        </span>
+71	      </div>
+72	    </header>
+73	  );
+74	}
+75	
+76	function MainArea({
+77	  graphRefreshSignal,
+78	  onIngestProcessed,
+79	}: {
+80	  graphRefreshSignal: number;
+81	  onIngestProcessed: () => void;
+82	}) {
+83	  const { currentSessionId, sessions, createSession } = useSessions();
+84	  const [creating, setCreating] = useState(false);
+85	
+86	  if (!currentSessionId) {
+87	    return (
+88	      <div className="flex items-center justify-center p-8 overflow-hidden">
+89	        <div className="max-w-md w-full flex flex-col items-center gap-3 text-center">
+90	          <div className="text-sm text-muted-foreground">
+91	            {sessions.length === 0
+92	              ? "Welcome. Start by creating your first session."
+93	              : "Select a session from the sidebar or create a new one."}
+94	          </div>
+95	          <Button
+96	            onClick={async () => {
+97	              setCreating(true);
+98	              try {
+99	                await createSession();
+100	              } finally {
+101	                setCreating(false);
+102	              }
+103	            }}
+104	            disabled={creating}
+105	          >
+106	            <Plus className="h-3.5 w-3.5" />
+107	            {creating ? "Creating…" : "New session"}
+108	          </Button>
+109	        </div>
+110	      </div>
+111	    );
+112	  }
+113	
+114	  return (
+115	    <div className="flex-1 min-h-0 overflow-hidden p-3">
+116	      <ResizablePanelGroup
+117	        orientation="horizontal"
+118	        className="h-full w-full"
+119	      >
+120	        <ResizablePanel
+121	          defaultSize={24}
+122	          minSize={18}
+123	          maxSize={34}
+124	          className="overflow-hidden!"
+125	        >
+126	          <IngestPanel onProcessed={onIngestProcessed} />
+127	        </ResizablePanel>
+128	        <ResizableHandle withHandle className="mx-1.5 bg-border/60" />
+129	        <ResizablePanel
+130	          defaultSize={50}
+131	          minSize={28}
+132	          className="overflow-hidden!"
+133	        >
+134	          <GraphPanel refreshSignal={graphRefreshSignal} />
+135	        </ResizablePanel>
+136	        <ResizableHandle withHandle className="mx-1.5 bg-border/60" />
+137	        <ResizablePanel
+138	          defaultSize={26}
+139	          minSize={20}
+140	          maxSize={36}
+141	          className="overflow-hidden!"
+142	        >
+143	          <RetrievePanel />
+144	        </ResizablePanel>
+145	      </ResizablePanelGroup>
+146	    </div>
+147	  );
+148	}
+149
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:44:31Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:44:31Z)**_
+
+Let me also fix one stale `!h-4` Tailwind 3 syntax in the header to be safe.
+
+_**Agent (claude-opus-4-7 2026-05-12 16:44:33Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String:         <Separator orientation="vertical" className="!h-4" /></tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:44:38Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:44:38Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Find the h-4 line
+
+`grep -n "h-4" /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/app-shell.tsx`
+
+```text
+62:      <Separator orientation="vertical" className="!h-4" />
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:44:43Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./client/components/app/app-shell.tsx`
+
+```text
+62	      <Separator orientation="vertical" className="!h-4" />
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:44:55Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/app-shell.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:45:03Z)**_
+
+_**Agent (claude-opus-4-7 2026-05-12 16:45:03Z)**_
+
+Got it — fixed side panels, only the middle is fluid. Removing the resizable layer.
+
+_**Agent (claude-opus-4-7 2026-05-12 16:45:07Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/app-shell.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:45:35Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file /Users/karthiknadar/Desktop/zep-paper-implementation/client/components/app/app-shell.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-7 2026-05-12 16:45:42Z)**_
+
+Done. Reload your browser.
+
+**What changed:**
+- Removed `ResizablePanelGroup`, `ResizablePanel`, `ResizableHandle` entirely — no more drag handles.
+- Layout is now a plain flex row with three fixed children:
+  - **Left — Ingest:** `w-[340px]` fixed, `shrink-0`
+  - **Middle — Graph:** `flex-1`, fluid, fills whatever's left
+  - **Right — Ask:** `w-[400px]` fixed, `shrink-0`
+- `gap-3` between them gives the breathing room the resize handles used to provide.
+- Side panels still get a proper height via the same `h-svh` ceiling on `SidebarInset` and `flex-1 min-h-0` on the outer container.
+
+If you want different widths for ingest vs ask, just tweak `w-[340px]` / `w-[400px]` — they're independent now. Anything from `w-[300px]` to `w-[440px]` will read nicely on most screens.

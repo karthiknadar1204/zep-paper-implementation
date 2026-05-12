@@ -6,6 +6,7 @@ import { sessionsRouter } from "./routes/sessions.routes";
 import { ingestRouter } from "./routes/ingest.routes";
 import { episodesRouter } from "./routes/episodes.routes";
 import { retrieveRouter } from "./routes/retrieve.routes";
+import { graphRouter } from "./routes/graph.routes";
 import {
   requireAuth,
   type AuthVariables,
@@ -27,6 +28,7 @@ protectedRoutes.route("/sessions", sessionsRouter);
 protectedRoutes.route("/ingest", ingestRouter);
 protectedRoutes.route("/episodes", episodesRouter);
 protectedRoutes.route("/retrieve", retrieveRouter);
+protectedRoutes.route("/graph", graphRouter);
 
 app.route("/", protectedRoutes);
 

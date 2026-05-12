@@ -25,6 +25,7 @@ export type CreateEpisodeInput = {
   actor: "user" | "assistant" | "system";
   content: string;
   occurredAt?: string;
+  type?: "message" | "text" | "json";
 };
 
 export async function createEpisode(
@@ -42,6 +43,9 @@ export async function createEpisode(
   }
 
   const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
+  // Episode type stored in metadata jsonb (no schema migration) — default
+  // "message". The worker reads this via episodeType() below.
+  const metadata = input.type ? { type: input.type } : null;
 
   const [row] = await db
     .insert(episodes)
@@ -51,12 +55,20 @@ export async function createEpisode(
       actor: input.actor,
       content: input.content,
       occurredAt,
+      metadata,
     })
     .returning();
 
   await enqueueEpisodeProcessing(row.id);
 
   return row;
+}
+
+export function episodeType(ep: EpisodeRow): "message" | "text" | "json" {
+  const meta = ep.metadata as { type?: unknown } | null | undefined;
+  const t = meta?.type;
+  if (t === "text" || t === "json" || t === "message") return t;
+  return "message";
 }
 
 export async function getEpisodeWithLogs(

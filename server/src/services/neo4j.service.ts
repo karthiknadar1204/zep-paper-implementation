@@ -46,6 +46,34 @@ export function normalizeEntityName(name: string): string {
   return name.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+// Used by hybrid entity resolution (Tier 2.7) to fetch full entity props for
+// candidate ids surfaced by cosine search.
+export async function findEntitiesByIds(
+  userId: string,
+  entityIds: string[],
+): Promise<GraphEntity[]> {
+  if (entityIds.length === 0) return [];
+  const records = await runQuery(
+    `
+    MATCH (e:Entity { userId: $userId })
+    WHERE e.entityId IN $ids
+    RETURN e
+    `,
+    { userId, ids: entityIds },
+  );
+  return records.map((record) => {
+    const p = record.get("e").properties;
+    return {
+      entityId: p.entityId,
+      userId: p.userId,
+      name: p.name,
+      normalizedName: p.normalizedName,
+      type: p.type,
+      summary: p.summary,
+    } satisfies GraphEntity;
+  });
+}
+
 export async function findEntitiesByNormalizedNames(
   userId: string,
   normalizedNames: string[],
@@ -199,6 +227,8 @@ export async function findOpenFactsForSourceAndRelation(
   }));
 }
 
+// tExpired tracks transaction-time invalidation (when the system learned the
+// fact ended), distinct from validUntil which is event-time. Paper §2.2.3.
 export async function closeFact(
   factId: string,
   validUntil: string,
@@ -206,10 +236,110 @@ export async function closeFact(
   await runQuery(
     `
     MATCH ()-[f:FACT { factId: $factId }]->()
-    SET f.validUntil = datetime($validUntil)
+    SET f.validUntil = datetime($validUntil),
+        f.tExpired = coalesce(f.tExpired, datetime())
     `,
     { factId, validUntil },
   );
+}
+
+// Reaffirmation: append the new episode to provenance and bump confidence
+// instead of writing a duplicate edge. Idempotent on (factId, episodeId).
+export async function reinforceFact(
+  factId: string,
+  episodeId: string,
+  occurredAt: string,
+  confidenceBump: number = 0.01,
+): Promise<void> {
+  await runQuery(
+    `
+    MATCH ()-[f:FACT { factId: $factId }]->()
+    WITH f,
+      coalesce(f.episodeIds, [f.episodeId]) AS currentIds,
+      coalesce(f.confidence, 1.0) AS currentConf
+    SET
+      f.episodeIds = CASE
+        WHEN $episodeId IN currentIds THEN currentIds
+        ELSE currentIds + $episodeId
+      END,
+      f.confidence = CASE
+        WHEN currentConf + $bump > 1.0 THEN 1.0
+        ELSE currentConf + $bump
+      END,
+      f.lastSeenAt = datetime($occurredAt)
+    `,
+    { factId, episodeId, occurredAt, bump: confidenceBump },
+  );
+}
+
+export type OpenFactRow = {
+  factId: string;
+  sourceEntityId: string;
+  targetEntityId: string;
+  relationType: string;
+  factText: string;
+  validFrom: string;
+};
+
+// All open facts on a source entity, used for semantic invalidation (Tier 2.8).
+// Optionally filtered by source.
+export async function findOpenFactsForSource(
+  sourceEntityId: string,
+): Promise<OpenFactRow[]> {
+  const records = await runQuery(
+    `
+    MATCH (a:Entity { entityId: $sourceEntityId })-[f:FACT]->(b:Entity)
+    WHERE f.validUntil IS NULL
+    RETURN
+      f.factId AS factId,
+      a.entityId AS sourceEntityId,
+      b.entityId AS targetEntityId,
+      f.relationType AS relationType,
+      f.factText AS factText,
+      toString(f.validFrom) AS validFrom
+    `,
+    { sourceEntityId },
+  );
+  return records.map((r) => ({
+    factId: r.get("factId") as string,
+    sourceEntityId: r.get("sourceEntityId") as string,
+    targetEntityId: r.get("targetEntityId") as string,
+    relationType: r.get("relationType") as string,
+    factText: (r.get("factText") as string) ?? "",
+    validFrom: r.get("validFrom") as string,
+  }));
+}
+
+// All facts (any open/closed state) between a specific (source, target) pair.
+// Used for pair-scoped dedup (Tier 2.9).
+export async function findFactsBySourceAndTarget(
+  sourceEntityId: string,
+  targetEntityId: string,
+): Promise<OpenFactRow[]> {
+  const records = await runQuery(
+    `
+    MATCH (a:Entity { entityId: $sourceEntityId })
+          -[f:FACT]->
+          (b:Entity { entityId: $targetEntityId })
+    WHERE f.validUntil IS NULL
+    RETURN
+      f.factId AS factId,
+      a.entityId AS sourceEntityId,
+      b.entityId AS targetEntityId,
+      f.relationType AS relationType,
+      f.factText AS factText,
+      toString(f.validFrom) AS validFrom
+    `,
+    { sourceEntityId, targetEntityId },
+  );
+  return records.map((r) => ({
+    factId: r.get("factId") as string,
+    sourceEntityId: r.get("sourceEntityId") as string,
+    targetEntityId: r.get("targetEntityId") as string,
+    relationType: r.get("relationType") as string,
+    factText: (r.get("factText") as string) ?? "",
+    validFrom: r.get("validFrom") as string,
+  }));
 }
 
 export type ExpandedFact = {
@@ -289,7 +419,10 @@ export async function upsertFact(fact: GraphFact): Promise<void> {
       f.validUntil = CASE WHEN $validUntil IS NULL THEN NULL ELSE datetime($validUntil) END,
       f.confidence = $confidence,
       f.episodeId = $episodeId,
-      f.createdAt = datetime()
+      f.episodeIds = [$episodeId],
+      f.createdAt = datetime(),
+      f.tCreated = datetime(),
+      f.lastSeenAt = datetime($validFrom)
     `,
     fact,
   );

@@ -78,6 +78,93 @@ Output: { "entities": [] }
 
 Return JSON exactly: { "entities": [ { "name": string, "type": string, "summary": string } ] }`;
 
+const REFLEXION_SYSTEM = `You are reviewing an entity extraction for completeness and correctness.
+
+Given the conversation context and a DRAFT list of entities a prior extractor produced, identify:
+- add: entities the draft MISSED that are clearly referenced in the CURRENT message and worth remembering (people, organizations, places, products, projects, concepts the speaker has a relationship to).
+- remove: entries in the draft that are NOT actually referenced in the CURRENT message, are the speaker themselves, are pure temporal expressions ("yesterday", "2024"), or are clearly hallucinated.
+
+Rules:
+- Use the same schema as the original prompt (name canonical, type ∈ {PERSON,COMPANY,LOCATION,CONCEPT,PRODUCT,DATE,OTHER}, summary grounded in text).
+- Only suggest additions/removals if you are confident — if the draft is fine, return both lists empty.
+- Do NOT add the speaker; the system tracks them separately.
+- "remove" identifies entries by their EXACT name as it appears in the draft.
+
+Return JSON exactly: {
+  "add": [ { "name": string, "type": string, "summary": string } ],
+  "remove": [ string ]
+}`;
+
+const ReflexionResponseSchema = z.object({
+  add: z.array(RawEntitySchema),
+  remove: z.array(z.string()),
+});
+
+async function reflectOnEntities(
+  current: EpisodeMessage,
+  recent: EpisodeMessage[],
+  draft: RawEntity[],
+): Promise<RawEntity[]> {
+  const recentBlock = recent.length
+    ? recent.map((m) => `${m.actor}: ${m.content}`).join("\n")
+    : "(none)";
+
+  const draftBlock =
+    draft.length === 0
+      ? "(empty)"
+      : draft
+          .map((e) => `- ${e.name} [${e.type}]: ${e.summary}`)
+          .join("\n");
+
+  const userPrompt = `[Recent context]
+${recentBlock}
+
+[Current message]
+${current.actor}: ${current.content}
+
+[Draft entities]
+${draftBlock}`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: REFLEXION_SYSTEM },
+        { role: "user", content: userPrompt },
+      ],
+    });
+    const raw = completion.choices[0]?.message?.content;
+    if (!raw) return draft;
+    const json = JSON.parse(raw);
+    const validated = ReflexionResponseSchema.parse(json);
+
+    const removeSet = new Set(
+      validated.remove.map((n) => n.trim().toLowerCase()),
+    );
+    const filtered = draft.filter(
+      (e) => !removeSet.has(e.name.trim().toLowerCase()),
+    );
+
+    const seenNames = new Set(
+      filtered.map((e) => e.name.trim().toLowerCase()),
+    );
+    for (const add of validated.add) {
+      const key = add.name.trim().toLowerCase();
+      if (seenNames.has(key)) continue;
+      seenNames.add(key);
+      filtered.push(add);
+    }
+    return filtered;
+  } catch (err) {
+    console.error(
+      "[extraction] reflexion failed; using draft:",
+      err instanceof Error ? err.message : err,
+    );
+    return draft;
+  }
+}
+
 export async function extractEntities(
   current: EpisodeMessage,
   recent: EpisodeMessage[] = [],
@@ -106,7 +193,12 @@ ${current.actor}: ${current.content}`;
 
   const json = JSON.parse(raw);
   const validated = EntityListSchema.parse(json);
-  return validated.entities;
+  const draft = validated.entities;
+
+  if (process.env.ZEP_LLM_REFLEXION === "1") {
+    return reflectOnEntities(current, recent, draft);
+  }
+  return draft;
 }
 
 export type FactExtractionEntity = {
@@ -220,6 +312,89 @@ Return JSON exactly: {
   "facts": [ { "sourceEntityId": string, "targetEntityId": string, "relationType": string, "factText": string, "confidence": number } ],
   "invalidations": [ { "sourceEntityId": string, "targetEntityId": string, "relationType": string } ]
 }`;
+
+const TEMPORAL_EXTRACTION_SYSTEM = `You extract event-time bounds from a fact within a conversation.
+
+Given a fact (a triple expressed as a short sentence), the message it was extracted from, prior context, and a reference timestamp, determine:
+- validAt: when the relationship described by the fact STARTED or was established (event time).
+- invalidAt: when the relationship described by the fact ENDED, if mentioned.
+
+Rules:
+1. Only set dates that are explicitly tied to the FACT'S formation or termination. Do NOT infer from unrelated dates in the message.
+2. If a relative time is mentioned ("two weeks ago", "last summer", "yesterday"), compute the actual datetime from the reference timestamp.
+3. If only a date is mentioned (no time), use 00:00:00 of that date.
+4. If only a year is mentioned, use January 1st of that year at 00:00:00.
+5. Always emit ISO 8601 UTC (YYYY-MM-DDTHH:MM:SS.SSSZ) with the Z suffix.
+6. If the fact is in present tense and no other time signal is present, set validAt = reference timestamp AND invalidAt = null.
+7. If no temporal signal is present at all, set both fields to null.
+8. If the fact only describes an endpoint ("X stopped Y", "X left Y"), set invalidAt; leave validAt null unless the start is also stated.
+9. The standalone word "now" indicates present tense — set validAt = reference timestamp, invalidAt = null. "Now" never means the fact ENDS now.
+10. invalidAt MUST be strictly LATER than validAt. A relationship cannot end at or before it began. If you would produce invalidAt <= validAt, set BOTH fields to null instead.
+11. Contrastive phrases in the surrounding message ("loves X now, not Y") refer to a DIFFERENT subject and do NOT mean this fact has ended. Ignore them when setting invalidAt for THIS fact.
+
+Return JSON exactly: { "validAt": string|null, "invalidAt": string|null }`;
+
+const TemporalResponseSchema = z.object({
+  validAt: z.string().nullable(),
+  invalidAt: z.string().nullable(),
+});
+
+export type ExtractedTemporal = {
+  validAt: string | null;
+  invalidAt: string | null;
+};
+
+export async function extractTemporal(
+  factText: string,
+  current: EpisodeMessage,
+  recent: EpisodeMessage[],
+  referenceTimestamp: string,
+): Promise<ExtractedTemporal> {
+  const recentBlock = recent.length
+    ? recent.map((m) => `${m.actor}: ${m.content}`).join("\n")
+    : "(none)";
+
+  const userPrompt = `[PREVIOUS MESSAGES]
+${recentBlock}
+
+[CURRENT MESSAGE]
+${current.actor}: ${current.content}
+
+[REFERENCE TIMESTAMP]
+${referenceTimestamp}
+
+[FACT]
+${factText}`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: TEMPORAL_EXTRACTION_SYSTEM },
+        { role: "user", content: userPrompt },
+      ],
+    });
+    const raw = completion.choices[0]?.message?.content;
+    if (!raw) return { validAt: null, invalidAt: null };
+    const json = JSON.parse(raw);
+    const validated = TemporalResponseSchema.parse(json);
+
+    const isIso = (s: string | null) =>
+      s !== null && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(s);
+
+    return {
+      validAt: isIso(validated.validAt) ? validated.validAt : null,
+      invalidAt: isIso(validated.invalidAt) ? validated.invalidAt : null,
+    };
+  } catch (err) {
+    console.error(
+      "[extraction] temporal extraction failed; falling back to occurredAt:",
+      err instanceof Error ? err.message : err,
+    );
+    return { validAt: null, invalidAt: null };
+  }
+}
 
 export async function extractFacts(
   current: EpisodeMessage,
