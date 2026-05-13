@@ -19,10 +19,6 @@ import {
 } from "./extraction.service";
 import { openai } from "../utils/openai";
 
-const LLM_TEMPORAL_FLAG = "ZEP_LLM_TEMPORAL";
-const LLM_INVALIDATE_FLAG = "ZEP_LLM_INVALIDATE";
-const LLM_FACT_DEDUP_FLAG = "ZEP_LLM_FACT_DEDUP";
-
 // Cosine similarity for semantic-invalidation candidate filtering. Threshold is
 // permissive — the LLM judge does the precise contradiction decision.
 const SEMANTIC_INVALIDATE_MIN_SIM = 0.45;
@@ -182,16 +178,14 @@ export async function applyTemporalFacts(
     return { written: [], closed: [], skipped: 0 };
   }
 
-  // Tier 2.5: if flag is on AND context was provided, ask the LLM to derive
-  // event-time bounds per fact. Falls back to occurredAt on any null result.
-  const llmTemporalEnabled =
-    process.env[LLM_TEMPORAL_FLAG] === "1" && ctx !== undefined;
-
+  // LLM event-time extraction is always on whenever ctx is provided. Per-fact
+  // result of null falls back to occurredAt at the write site. Callers that
+  // omit ctx (e.g. in-process unit tests) skip this LLM call entirely.
   const temporalByIndex = new Map<
     number,
     { validAt: string | null; invalidAt: string | null }
   >();
-  if (llmTemporalEnabled && ctx) {
+  if (ctx !== undefined) {
     await Promise.all(
       rawFacts.map(async (f, i) => {
         const t = await extractTemporal(
@@ -238,7 +232,7 @@ export async function applyTemporalFacts(
   }
 
   const toClose: Array<{ factId: string; targetEntityId: string }> = [];
-  for (const [key, existings] of existingByGroup) {
+  for (const [key, existings] of Array.from(existingByGroup.entries())) {
     const newTargets = newTargetsByGroup.get(key) ?? new Set<string>();
     for (const old of existings) {
       if (!newTargets.has(old.targetEntityId)) {
@@ -259,8 +253,6 @@ export async function applyTemporalFacts(
   const written: TemporalFact[] = [];
   let skipped = 0;
 
-  const factDedupEnabled = process.env[LLM_FACT_DEDUP_FLAG] === "1";
-
   const writes: Promise<void>[] = [];
   for (let i = 0; i < rawFacts.length; i++) {
     const raw = rawFacts[i];
@@ -277,10 +269,11 @@ export async function applyTemporalFacts(
       continue;
     }
 
-    // Tier 2.9: pair-scoped semantic dedup. Catches cases where the same fact
-    // is re-expressed with a different relationType label (e.g. "WORKS_AT" vs
-    // "EMPLOYED_BY"). Only runs when flag is on; only merges on HIGH similarity.
-    if (factDedupEnabled) {
+    // Pair-scoped semantic dedup (always on). Catches cases where the same
+    // fact is re-expressed with a different relationType label (e.g. WORKS_AT
+    // vs EMPLOYED_BY). Only merges on HIGH cosine similarity to avoid false
+    // positives.
+    {
       const pairFacts = await findFactsBySourceAndTarget(
         raw.sourceEntityId,
         raw.targetEntityId,
@@ -377,11 +370,11 @@ export async function applyTemporalFacts(
     }),
   );
 
-  // Tier 2.8: semantic invalidation pass. Only runs when flag is on. Operates
-  // ONLY on edges not already closed above, so this pass can only close MORE,
-  // never override prior decisions.
+  // Semantic invalidation pass (always on). Operates ONLY on edges not already
+  // closed by the rule path above, so it can only close MORE, never override
+  // prior decisions. If the LLM judge errors per-candidate, nothing closes.
   const semanticClosed: ClosedEdge[] = [];
-  if (process.env[LLM_INVALIDATE_FLAG] === "1" && rawFacts.length > 0) {
+  if (rawFacts.length > 0) {
     const alreadyClosed = new Set<string>([
       ...closed.map((c) => c.factId),
       ...invalidationCloses.map((c) => c.factId),

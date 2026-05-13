@@ -1,7 +1,7 @@
-// Tier 2 flag-gated path smoke test.
-// Toggles each ZEP_LLM_* flag at runtime, drives a targeted fixture through
-// the relevant service, and asserts the flagged-vs-baseline difference.
-// Costs ~$0.01 in OpenAI API per run.
+// Paper-faithful path smoke test.
+// All five previously-flagged paths are now ALWAYS ON. This test verifies that
+// each one produces its expected outcome on a targeted fixture. Costs ~$0.01 in
+// OpenAI API per run.
 import { randomUUID } from "node:crypto";
 import { neo4jDriver } from "../src/utils/neo4j";
 import {
@@ -36,11 +36,6 @@ function assert(cond: unknown, msg: string) {
     console.log(`  ✓ ${msg}`);
     passed++;
   }
-}
-
-function setFlag(name: string, on: boolean) {
-  if (on) process.env[name] = "1";
-  else delete process.env[name];
 }
 
 async function cleanup() {
@@ -84,9 +79,9 @@ async function ensureUser(): Promise<GraphEntity> {
   return self;
 }
 
-// ─── Tier 2.5: LLM temporal extraction ───────────────────────────────
+// ─── LLM event-time extraction (was Tier 2.5) ────────────────────────
 async function testTemporalExtraction() {
-  console.log("\n==== Tier 2.5: ZEP_LLM_TEMPORAL ====");
+  console.log("\n==== LLM event-time extraction ====");
   await cleanup();
   await ensureUser();
   const anthropic: GraphEntity = {
@@ -117,79 +112,50 @@ async function testTemporalExtraction() {
     recent: [],
   };
 
-  // Baseline: flag off → validFrom = occurredAt
-  setFlag("ZEP_LLM_TEMPORAL", false);
   await applyTemporalFacts(facts, [], randomUUID(), occurredAt, ctx);
-  let opens = await findOpenFactsForSource(TEST_USER_ID);
-  assert(opens.length === 1, "baseline: 1 open fact");
-  console.log(`    baseline validFrom: ${opens[0].validFrom}`);
-  assert(
-    opens[0].validFrom.startsWith("2026-05-12"),
-    "baseline: validFrom = occurredAt (no LLM rewrite)",
-  );
-
-  // Flag on → validFrom shifted backwards
-  await cleanup();
-  await ensureUser();
-  await upsertEntity(anthropic);
-
-  setFlag("ZEP_LLM_TEMPORAL", true);
-  await applyTemporalFacts(facts, [], randomUUID(), occurredAt, ctx);
-  setFlag("ZEP_LLM_TEMPORAL", false);
-
-  opens = await findOpenFactsForSource(TEST_USER_ID);
-  assert(opens.length === 1, "flagged: 1 open fact");
-  console.log(`    flagged  validFrom: ${opens[0].validFrom}`);
+  const opens = await findOpenFactsForSource(TEST_USER_ID);
+  assert(opens.length === 1, "1 open fact written");
+  console.log(`    validFrom: ${opens[0].validFrom}`);
   const year = parseInt(opens[0].validFrom.slice(0, 4), 10);
   assert(
     year <= 2024,
-    `flagged: validFrom year ≤ 2024 (got ${year}; "two years ago" from 2026-05)`,
+    `validFrom year ≤ 2024 (got ${year}; "two years ago" from 2026-05)`,
   );
 }
 
-// ─── Tier 2.6: reflexion on entity extraction ────────────────────────
+// ─── Reflexion entity-extraction pass (was Tier 2.6) ─────────────────
 async function testReflexion() {
-  console.log("\n==== Tier 2.6: ZEP_LLM_REFLEXION ====");
+  console.log("\n==== Reflexion entity-extraction pass ====");
   const msg = {
     actor: "user" as const,
     content:
       "I've been getting really into bouldering lately, and also reading more philosophy.",
   };
 
-  setFlag("ZEP_LLM_REFLEXION", false);
-  const baseline = await extractEntities(msg);
+  const result = await extractEntities(msg);
   console.log(
-    `    baseline (${baseline.length}): ${baseline.map((e) => `${e.name}[${e.type}]`).join(", ") || "(none)"}`,
+    `    extracted (${result.length}): ${result.map((e) => `${e.name}[${e.type}]`).join(", ") || "(none)"}`,
   );
 
-  setFlag("ZEP_LLM_REFLEXION", true);
-  const flagged = await extractEntities(msg);
-  setFlag("ZEP_LLM_REFLEXION", false);
-  console.log(
-    `    flagged  (${flagged.length}): ${flagged.map((e) => `${e.name}[${e.type}]`).join(", ") || "(none)"}`,
-  );
-
-  // Reflexion is non-deterministic. Only assert the path runs and returns
-  // well-formed entities — never assert > or < count, since LLMs vary.
-  assert(Array.isArray(flagged), "flagged: returns array");
+  // Non-deterministic. Only assert the path runs and returns well-formed entities.
+  assert(Array.isArray(result), "returns array");
   assert(
-    flagged.every(
+    result.every(
       (e) =>
         typeof e.name === "string" &&
         e.name.length > 0 &&
         typeof e.type === "string" &&
         typeof e.summary === "string",
     ),
-    "flagged: each entity well-formed (name+type+summary)",
+    "each entity well-formed (name+type+summary)",
   );
 }
 
-// ─── Tier 2.7: hybrid entity resolution (cosine + LLM) ───────────────
+// ─── Hybrid entity resolution (was Tier 2.7) ─────────────────────────
 async function testHybridResolve() {
-  console.log("\n==== Tier 2.7: ZEP_LLM_ENTITY_RESOLVE ====");
+  console.log("\n==== Hybrid cosine+LLM entity resolution ====");
   await cleanup();
 
-  // Seed: create "Anthropic" via the real resolver path + put vector in Pinecone
   const rawSeed: RawEntity[] = [
     {
       name: "Anthropic",
@@ -212,36 +178,21 @@ async function testHybridResolve() {
     },
   ];
 
-  // Baseline: flag off → normalized name differs → new entity
-  setFlag("ZEP_LLM_ENTITY_RESOLVE", false);
-  const baseline = await resolveEntities(TEST_USER_ID, rawNew);
-  assert(baseline.length === 1, "baseline: 1 resolved");
-  assert(baseline[0].isNew, "baseline: created NEW (no hybrid path)");
-  assert(
-    baseline[0].entityId !== anthropicId,
-    "baseline: different entityId from seed",
-  );
-  // Remove the duplicate so the flagged path has a clean starting state
-  await deleteEntityById(baseline[0].entityId);
-
-  // Flag on → should resolve back to the seed
-  setFlag("ZEP_LLM_ENTITY_RESOLVE", true);
-  const flagged = await resolveEntities(TEST_USER_ID, rawNew);
-  setFlag("ZEP_LLM_ENTITY_RESOLVE", false);
-  assert(flagged.length === 1, "flagged: 1 resolved");
+  const result = await resolveEntities(TEST_USER_ID, rawNew);
+  assert(result.length === 1, "1 resolved");
   console.log(
-    `    flagged: entityId=${flagged[0].entityId.slice(0, 8)}.. isNew=${flagged[0].isNew} name="${flagged[0].name}"`,
+    `    entityId=${result[0].entityId.slice(0, 8)}.. isNew=${result[0].isNew} name="${result[0].name}"`,
   );
-  assert(!flagged[0].isNew, "flagged: resolved to EXISTING entity");
+  assert(!result[0].isNew, "resolved to EXISTING entity (hybrid path)");
   assert(
-    flagged[0].entityId === anthropicId,
-    'flagged: same entityId as seed ("Anthropic" ≡ "Anthropic Inc.")',
+    result[0].entityId === anthropicId,
+    'same entityId as seed ("Anthropic" ≡ "Anthropic Inc.")',
   );
 }
 
-// ─── Tier 2.8: semantic edge invalidation ────────────────────────────
+// ─── Semantic edge invalidation (was Tier 2.8) ───────────────────────
 async function testSemanticInvalidation() {
-  console.log("\n==== Tier 2.8: ZEP_LLM_INVALIDATE ====");
+  console.log("\n==== Semantic edge invalidation ====");
   await cleanup();
   await ensureUser();
 
@@ -278,7 +229,7 @@ async function testSemanticInvalidation() {
   }
   await upsertFact(makeSeedFact());
 
-  // New fact: same idea, different relationType ⇒ rule path can't catch it
+  // New fact: same idea, different relationType ⇒ rule path alone cannot catch
   const newFact: RawFact = {
     sourceEntityId: TEST_USER_ID,
     targetEntityId: tokyo.entityId,
@@ -292,47 +243,26 @@ async function testSemanticInvalidation() {
     recent: [],
   };
 
-  // Baseline: rule misses cross-predicate contradiction
-  setFlag("ZEP_LLM_INVALIDATE", false);
   await applyTemporalFacts([newFact], [], randomUUID(), occurredAt, ctx);
-  let opens = await findOpenFactsForSource(TEST_USER_ID);
-  assert(
-    opens.find((o) => o.relationType === "LIVES_IN") !== undefined,
-    "baseline: Boston/LIVES_IN STILL open (rule path can't see cross-predicate)",
-  );
-  assert(
-    opens.find((o) => o.relationType === "RESIDES_IN") !== undefined,
-    "baseline: Tokyo/RESIDES_IN written",
-  );
 
-  // Reset + flag on
-  await cleanup();
-  await ensureUser();
-  await upsertEntities([boston, tokyo]);
-  await upsertFact(makeSeedFact());
-
-  setFlag("ZEP_LLM_INVALIDATE", true);
-  await applyTemporalFacts([newFact], [], randomUUID(), occurredAt, ctx);
-  setFlag("ZEP_LLM_INVALIDATE", false);
-
-  opens = await findOpenFactsForSource(TEST_USER_ID);
-  console.log(`    open facts after flagged: ${opens.length}`);
+  const opens = await findOpenFactsForSource(TEST_USER_ID);
+  console.log(`    open facts after ingest: ${opens.length}`);
   for (const o of opens) {
     console.log(`      ${o.relationType}: "${o.factText}"`);
   }
   assert(
     opens.find((o) => o.relationType === "LIVES_IN") === undefined,
-    "flagged: Boston CLOSED via semantic invalidation (Tier 2.8)",
+    "Boston/LIVES_IN CLOSED via semantic invalidation (cross-predicate)",
   );
   assert(
     opens.find((o) => o.relationType === "RESIDES_IN") !== undefined,
-    "flagged: Tokyo still open",
+    "Tokyo/RESIDES_IN still open",
   );
 }
 
-// ─── Tier 2.9: pair-scoped semantic fact dedup ───────────────────────
+// ─── Pair-scoped semantic fact dedup (was Tier 2.9) ──────────────────
 async function testPairScopedDedup() {
-  console.log("\n==== Tier 2.9: ZEP_LLM_FACT_DEDUP ====");
+  console.log("\n==== Pair-scoped semantic fact dedup ====");
   await cleanup();
   await ensureUser();
 
@@ -379,29 +309,15 @@ async function testPairScopedDedup() {
     recent: [],
   };
 
-  // Baseline: two edges
-  setFlag("ZEP_LLM_FACT_DEDUP", false);
-  await applyTemporalFacts([newFact], [], randomUUID(), occurredAt, ctx);
-  let pair = await findFactsBySourceAndTarget(TEST_USER_ID, company.entityId);
-  assert(pair.length === 2, `baseline: 2 edges (got ${pair.length})`);
-
-  // Reset + flag on
-  await cleanup();
-  await ensureUser();
-  await upsertEntity(company);
-  await upsertFact(makeSeedFact());
-
-  setFlag("ZEP_LLM_FACT_DEDUP", true);
   const newEpId = randomUUID();
   await applyTemporalFacts([newFact], [], newEpId, occurredAt, ctx);
-  setFlag("ZEP_LLM_FACT_DEDUP", false);
 
-  pair = await findFactsBySourceAndTarget(TEST_USER_ID, company.entityId);
-  console.log(`    edges after flagged: ${pair.length}`);
+  const pair = await findFactsBySourceAndTarget(TEST_USER_ID, company.entityId);
+  console.log(`    edges after ingest: ${pair.length}`);
   for (const p of pair) console.log(`      ${p.relationType}: "${p.factText}"`);
-  assert(pair.length === 1, "flagged: 1 edge (semantic dedup merged)");
+  assert(pair.length === 1, "1 edge (semantic dedup merged the duplicate)");
 
-  // Verify the merge reinforced the seed (not the other way around)
+  // Verify the seed got reinforced (not the other way around)
   const session = neo4jDriver.session();
   try {
     const result = await session.run(
@@ -413,7 +329,7 @@ async function testPairScopedDedup() {
     );
     const rec = result.records[0];
     if (!rec) {
-      assert(false, "flagged: seed factId still present");
+      assert(false, "seed factId still present");
     } else {
       const eps = rec.get("eps") as string[];
       const conf = rec.get("conf") as number;
@@ -423,12 +339,12 @@ async function testPairScopedDedup() {
       );
       assert(
         eps.includes(newEpId),
-        "flagged: seed.episodeIds contains the new episode",
+        "seed.episodeIds contains the new episode",
       );
-      assert(conf >= 0.91, "flagged: seed confidence bumped");
+      assert(conf >= 0.91, "seed confidence bumped");
       assert(
         lastSeenAt?.startsWith("2026-05-12") ?? false,
-        "flagged: seed lastSeenAt updated to new occurredAt",
+        "seed lastSeenAt updated to new occurredAt",
       );
     }
   } finally {

@@ -4,9 +4,8 @@
 //   bun run dev      (server on :3002)
 //   bun run worker
 //
-// Optional flags — set in .env.local BEFORE starting worker:
-//   ZEP_LLM_TEMPORAL=1 ZEP_LLM_INVALIDATE=1 ZEP_LLM_FACT_DEDUP=1
-//   ZEP_LLM_REFLEXION=1 ZEP_LLM_ENTITY_RESOLVE=1
+// All paper-faithful LLM paths (temporal extraction, reflexion, hybrid entity
+// resolution, semantic invalidation, pair-scoped fact dedup) are ALWAYS ON.
 const BASE = process.env.SCENARIO_BASE_URL ?? "http://localhost:3002";
 const EMAIL = `e2e+${Date.now()}@x.com`;
 const PASSWORD = "hunter22hunter22";
@@ -75,18 +74,7 @@ async function pollUntilProcessed(
 }
 
 async function main() {
-  console.log(`Base: ${BASE}`);
-  console.log(`Flags in env:`);
-  for (const name of [
-    "ZEP_LLM_TEMPORAL",
-    "ZEP_LLM_REFLEXION",
-    "ZEP_LLM_ENTITY_RESOLVE",
-    "ZEP_LLM_INVALIDATE",
-    "ZEP_LLM_FACT_DEDUP",
-  ]) {
-    console.log(`  ${name}=${process.env[name] ?? "(unset)"}`);
-  }
-  console.log(`(note: the worker reads these, not this script)\n`);
+  console.log(`Base: ${BASE}\n`);
 
   // signup + JWT
   console.log(`Signing up ${EMAIL}...`);

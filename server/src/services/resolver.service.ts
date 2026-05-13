@@ -14,7 +14,6 @@ import { openai } from "../utils/openai";
 
 export type ResolvedEntity = GraphEntity & { isNew: boolean };
 
-const LLM_RESOLVE_FLAG = "ZEP_LLM_ENTITY_RESOLVE";
 const SEMANTIC_TOPK = 5;
 const SEMANTIC_MIN_SCORE = 0.55;
 
@@ -135,8 +134,6 @@ export async function resolveEntities(
   const resolved: ResolvedEntity[] = [];
   const newEntities: GraphEntity[] = [];
 
-  const semanticEnabled = process.env[LLM_RESOLVE_FLAG] === "1";
-
   for (const [norm, raw] of byNorm) {
     const hit = existing.get(norm);
     if (hit) {
@@ -144,16 +141,14 @@ export async function resolveEntities(
       continue;
     }
 
-    if (semanticEnabled) {
-      const semanticHit = await semanticResolve(userId, raw);
-      if (semanticHit) {
-        // Update the canonical name on the matched entity if the LLM proposed a
-        // more complete form, but keep the existing entityId.
-        const merged: GraphEntity = { ...semanticHit, userId };
-        await upsertEntity(merged);
-        resolved.push({ ...merged, isNew: false });
-        continue;
-      }
+    // Hybrid cosine+LLM resolution is always on (paper §2.2.1). Falls back to
+    // create-new if no semantically-similar entity is found or the LLM errors.
+    const semanticHit = await semanticResolve(userId, raw);
+    if (semanticHit) {
+      const merged: GraphEntity = { ...semanticHit, userId };
+      await upsertEntity(merged);
+      resolved.push({ ...merged, isNew: false });
+      continue;
     }
 
     const entity: GraphEntity = {

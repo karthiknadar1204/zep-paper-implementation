@@ -195,10 +195,9 @@ ${current.actor}: ${current.content}`;
   const validated = EntityListSchema.parse(json);
   const draft = validated.entities;
 
-  if (process.env.ZEP_LLM_REFLEXION === "1") {
-    return reflectOnEntities(current, recent, draft);
-  }
-  return draft;
+  // Reflexion critic pass is always on (paper §2.2.1). Falls back to the draft
+  // if the critic LLM errors — see reflectOnEntities for the safety net.
+  return reflectOnEntities(current, recent, draft);
 }
 
 export type FactExtractionEntity = {
@@ -320,7 +319,7 @@ Given a fact (a triple expressed as a short sentence), the message it was extrac
 - invalidAt: when the relationship described by the fact ENDED, if mentioned.
 
 Rules:
-1. Only set dates that are explicitly tied to the FACT'S formation or termination. Do NOT infer from unrelated dates in the message.
+1. Only set dates that are EXPLICITLY tied to the FACT'S formation or termination by an actual date, year, or relative time expression in the text. Do NOT infer from unrelated dates in the message.
 2. If a relative time is mentioned ("two weeks ago", "last summer", "yesterday"), compute the actual datetime from the reference timestamp.
 3. If only a date is mentioned (no time), use 00:00:00 of that date.
 4. If only a year is mentioned, use January 1st of that year at 00:00:00.
@@ -331,6 +330,25 @@ Rules:
 9. The standalone word "now" indicates present tense — set validAt = reference timestamp, invalidAt = null. "Now" never means the fact ENDS now.
 10. invalidAt MUST be strictly LATER than validAt. A relationship cannot end at or before it began. If you would produce invalidAt <= validAt, set BOTH fields to null instead.
 11. Contrastive phrases in the surrounding message ("loves X now, not Y") refer to a DIFFERENT subject and do NOT mean this fact has ended. Ignore them when setting invalidAt for THIS fact.
+12. Past-tense framing alone ("used to", "previously", "back then", "worked on", "was at") is NOT a temporal signal — it tells you the relation is no longer current, NOT when it started or ended. NEVER fabricate a year or date to "fill in" the past. Without an explicit date in the text, both fields MUST be null.
+
+Examples of CORRECT outputs:
+
+  fact: "Karthik used to work at OpenAI."
+  reference: 2026-05-13T10:00:00.000Z
+  → { "validAt": null, "invalidAt": null }   ← no year stated, do NOT invent one
+
+  fact: "Karthik worked on the Codex project."
+  reference: 2026-05-13T10:00:00.000Z
+  → { "validAt": null, "invalidAt": null }   ← past tense alone is not a date
+
+  fact: "Karthik worked at OpenAI from 2018 to 2021."
+  reference: 2026-05-13T10:00:00.000Z
+  → { "validAt": "2018-01-01T00:00:00.000Z", "invalidAt": "2021-01-01T00:00:00.000Z" }
+
+  fact: "The user started at Anthropic two years ago."
+  reference: 2026-05-13T10:00:00.000Z
+  → { "validAt": "2024-05-13T10:00:00.000Z", "invalidAt": null }
 
 Return JSON exactly: { "validAt": string|null, "invalidAt": string|null }`;
 
